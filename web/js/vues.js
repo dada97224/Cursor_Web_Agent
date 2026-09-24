@@ -41,30 +41,45 @@ function carteProduit(produit) {
 }
 
 export async function accueil(racine) {
-  const donnees = await api("/api/accueil");
-  const menu = donnees.menu || {};
+  const donnees = await api("/api/messages");
+  const bulles = donnees.messages.length ? donnees.messages.map((message) => dom("article", {
+    classe: message.role === "maison" ? "bulle maison" : "bulle moi",
+    enfants: [
+      dom("strong", { texte: message.auteur }),
+      message.photo ? dom("img", { classe: "photo-ticket", attrs: { src: message.photo, alt: "" } }) : null,
+      dom("p", { texte: message.texte }),
+    ],
+  })) : [dom("article", {
+    classe: "bulle maison",
+    enfants: [dom("p", { texte: "Montre-moi un ticket, une photo du frigo, ou demande-moi où est le lait et ce qu'on peut cuisiner." })],
+  })];
   racine.append(
     barre("Maison"),
-    dom("section", { enfants: [
-      dom("h2", { texte: "Aujourd'hui" }),
-      ...(donnees.rappels.length ? donnees.rappels.map((rappel) => dom("a", {
-        classe: rappel.urgent ? "rappel urgent" : "rappel",
-        attrs: { href: rappel.lien },
-        enfants: [dom("strong", { texte: rappel.titre }), dom("span", { texte: rappel.detail })],
-      })) : [dom("p", { classe: "pas", texte: "Rien d'urgent." })]),
+    donnees.aujourd_hui ? dom("p", { classe: "rappel", texte: donnees.aujourd_hui }) : null,
+    dom("div", { classe: "fil", attrs: { id: "fil" }, enfants: bulles }),
+    dom("div", { classe: "suggestions", enfants: [
+      suggestion("Où est le lait ?"),
+      suggestion("Qu'est-ce qu'on mange ?"),
+      suggestion("Plus de pain"),
     ]}),
-    dom("section", { enfants: [
-      dom("h2", { texte: "Qu'est-ce qu'on mange ?" }),
-      menu.midi ? dom("article", { classe: "carte", enfants: [dom("h3", { texte: "Ce midi" }), dom("p", { texte: menu.midi })] }) : null,
-      menu.soir ? dom("article", { classe: "carte", enfants: [dom("h3", { texte: "Ce soir" }), dom("p", { texte: menu.soir })] }) : null,
-      ...(donnees.idees.length ? donnees.idees.map((idee) => dom("article", {
-        classe: "carte",
-        enfants: [dom("h3", { texte: idee.titre }), dom("p", { texte: idee.detail })],
-      })) : [dom("p", { classe: "pas", texte: "Ajoute ce qu'il y a dans la cuisine pour avoir des idées." })]),
-      dom("a", { classe: "bouton-secondaire", texte: "Menus de la semaine", attrs: { href: "#/menus" } }),
+    dom("form", { classe: "compositeur", attrs: { "data-form": "dire" }, enfants: [
+      dom("input", { attrs: { name: "texte", placeholder: "Parle, ou envoie une photo", autocomplete: "off" } }),
+      dom("input", { attrs: { type: "file", name: "photo", accept: "image/*", capture: "environment", id: "photo-chat" } }),
+      bouton("Photo", "choisir-photo", { classe: "bouton-secondaire bouton-ligne", attrs: {} }),
+      bouton("Micro", "micro", { classe: "bouton-secondaire bouton-ligne", attrs: {} }),
+      bouton("Envoyer", "rien", { classe: "bouton bouton-ligne", attrs: { type: "submit" } }),
     ]}),
-    dom("a", { classe: "bouton bouton-terre", texte: "Photo du ticket ou d'un produit", attrs: { href: "#/ajouter" } }),
   );
+  const fil = document.getElementById("fil");
+  if (fil) fil.scrollTop = fil.scrollHeight;
+}
+
+function suggestion(texte) {
+  return dom("button", {
+    classe: "bouton-secondaire bouton-ligne",
+    texte,
+    attrs: { type: "button", "data-action": "suggestion", "data-texte": texte },
+  });
 }
 
 export async function cuisine(racine, zoneStock) {

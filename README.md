@@ -2,7 +2,9 @@
 
 Application locale pour la maison. Elle tourne sur un ordinateur, et les téléphones du foyer l'ouvrent sur le Wi-Fi.
 
-Cuisine, courses, pharmacie, congélateur, réserves (avec l'emplacement), ménage, animaux, dates, menus, et plantes en version courte. Le module plantes détaillé viendra à part.
+On lui parle depuis l'accueil, au clavier ou au micro. Une photo de ticket remplit le stock. Une photo du frigo, quand les mots sont lisibles, sert à proposer une recette avec les étapes. « Où est le lait ? » et « range le lait dans le frigo » évitent de remplir des fiches.
+
+Les listes (courses, pharmacie, ménage, animaux, dates, plantes simples) restent derrière Maison. Le module plantes détaillé viendra à part.
 
 ## Lancer
 

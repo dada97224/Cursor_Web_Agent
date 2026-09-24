@@ -117,6 +117,17 @@ document.body.addEventListener("click", async (evenement) => {
       case "menage":
         await api(`/api/menage/${boutonClique.dataset.id}/fait`, { method: "POST", corps: { personne_id: personne().id, par: personne().nom } });
         break;
+      case "suggestion": {
+        const champTexte = document.querySelector(".compositeur input[name=texte]");
+        if (champTexte) champTexte.value = boutonClique.dataset.texte;
+        return;
+      }
+      case "choisir-photo":
+        document.getElementById("photo-chat")?.click();
+        return;
+      case "micro":
+        ecouter();
+        return;
       case "personne":
         localStorage.setItem("maison.personne", boutonClique.dataset.id);
         localStorage.setItem("maison.personneNom", boutonClique.dataset.nom);
@@ -202,6 +213,9 @@ document.body.addEventListener("submit", async (evenement) => {
       case "photo":
         await envoyerPhoto(formulaire, evenement.submitter);
         return;
+      case "dire":
+        await envoyerDire(formulaire, saisie);
+        break;
       default:
         throw new Error(`Formulaire inconnu : ${genre}`);
     }
@@ -260,6 +274,48 @@ async function enregistrerMenus(formulaire) {
     lignes.push({ jour: dateJour, moment, titre: champSaisie.value, court: false });
   }
   await api("/api/menus", { method: "PUT", corps: { lignes } });
+}
+
+async function envoyerDire(formulaire, saisie) {
+  const fichier = formulaire.querySelector("input[type=file]")?.files?.[0];
+  const auteur = personne().nom || "";
+  if (fichier) {
+    const corps = new FormData();
+    corps.append("photo", fichier);
+    corps.append("texte", saisie.texte || "");
+    corps.append("auteur", auteur);
+    const resultat = await api("/api/messages/photo", { method: "POST", corps });
+    direAVoixHaute(resultat.reponse);
+    return;
+  }
+  const resultat = await api("/api/messages", { method: "POST", corps: { texte: saisie.texte, auteur } });
+  direAVoixHaute(resultat.reponse);
+}
+
+function direAVoixHaute(texte) {
+  if (!sessionStorage.getItem("maison.voix") || !window.speechSynthesis) return;
+  sessionStorage.removeItem("maison.voix");
+  const phrase = new SpeechSynthesisUtterance(texte.slice(0, 400));
+  phrase.lang = "fr-FR";
+  window.speechSynthesis.speak(phrase);
+}
+
+function ecouter() {
+  const Reconnaissance = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const champTexte = document.querySelector(".compositeur input[name=texte]");
+  if (!Reconnaissance) {
+    montrerErreur(new Error("Le bouton micro marche sur l'ordinateur. Sur le téléphone, utilise le micro du clavier."));
+    champTexte?.focus();
+    return;
+  }
+  const reconnaissance = new Reconnaissance();
+  reconnaissance.lang = "fr-FR";
+  reconnaissance.onresult = (evenement) => {
+    if (champTexte) champTexte.value = evenement.results[0][0].transcript;
+    sessionStorage.setItem("maison.voix", "1");
+    champTexte?.form?.requestSubmit();
+  };
+  reconnaissance.start();
 }
 
 async function envoyerPhoto(formulaire, submitter) {

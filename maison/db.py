@@ -120,6 +120,15 @@ CREATE TABLE IF NOT EXISTS dates_famille (
     annee INTEGER,
     note TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY,
+    auteur TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('personne', 'maison')),
+    texte TEXT NOT NULL,
+    photo TEXT,
+    cree_le TEXT NOT NULL
+);
 """
 
 LIEUX_DEFAUT = [

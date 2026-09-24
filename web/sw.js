@@ -1,4 +1,4 @@
-const VERSION = "maison-3";
+const VERSION = "maison-4";
 const CACHE = `maison-${VERSION}`;
 
 self.addEventListener("install", (event) => {

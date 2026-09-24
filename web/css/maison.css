@@ -168,6 +168,15 @@ textarea { min-height: 80px; }
 }
 .ligne-course button.coche.fait { background: var(--vert); color: white; }
 .groupe h2 { font-size: 1.15rem; margin: 18px 0 8px; }
+.fil { display: flex; flex-direction: column; gap: 10px; max-height: 55vh; overflow: auto; }
+.bulle { max-width: 92%; padding: 12px 14px; border-radius: 16px; white-space: pre-wrap; }
+.bulle p { margin: 4px 0 0; }
+.bulle.moi { align-self: flex-end; background: var(--vert); color: white; }
+.bulle.maison { align-self: flex-start; background: var(--carte); border: 1px solid var(--ligne); }
+.suggestions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.compositeur { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.compositeur input[name="texte"] { flex: 1 1 180px; }
+.compositeur input[type="file"] { display: none; }
 :focus-visible { outline: 3px solid var(--vert); outline-offset: 2px; }
 @media (max-width: 380px) {
   .etats, .grille { grid-template-columns: 1fr; }

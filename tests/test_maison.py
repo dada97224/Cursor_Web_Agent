@@ -99,6 +99,21 @@ def test_etat_vide_revient_a_un(client):
     assert remis["etat"] == "y_en_a"
 
 
+def test_conversation(client):
+    ou = client.post("/api/messages", json={"texte": "où est le lait", "auteur": "Camille"})
+    assert ou.status_code == 200
+    assert "connais pas" in ou.json()["reponse"]
+    client.post("/api/messages", json={"texte": "range le lait dans le frigo", "auteur": "Camille"})
+    retrouve = client.post("/api/messages", json={"texte": "où est le lait"})
+    assert "Frigo" in retrouve.json()["reponse"]
+    client.post("/api/produits", json={"nom": "Œufs", "categorie": "cuisine", "quantite": 6, "etat": "y_en_a"})
+    client.post("/api/produits", json={"nom": "Pâtes", "categorie": "cuisine", "quantite": 2, "etat": "y_en_a"})
+    repas = client.post("/api/messages", json={"texte": "qu'est-ce qu'on mange"})
+    assert "1." in repas.json()["reponse"]
+    manque = client.post("/api/messages", json={"texte": "plus de pain"})
+    assert "pain" in manque.json()["reponse"].lower()
+
+
 def test_menus_et_plante(client):
     semaine = client.get("/api/menus").json()
     assert len(semaine) == 7

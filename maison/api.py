@@ -5,7 +5,7 @@ from datetime import date
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from maison import config, courses, foyer, ocr, produits, rappels
+from maison import assistant, config, courses, foyer, ocr, produits, rappels
 from maison.db import ouvrir
 from maison.erreurs import ErreurMaison
 from maison.images import enregistrer_image, url_media
@@ -113,6 +113,11 @@ class LigneTicket(BaseModel):
 class ActionPersonne(BaseModel):
     personne_id: int | None = None
     par: str = ""
+
+
+class DireCorps(BaseModel):
+    texte: str
+    auteur: str = ""
 
 
 def _verifier_categorie(categorie: str) -> None:
@@ -622,6 +627,36 @@ def supprimer_date(date_id: int):
         if not foyer.supprimer_date(conn, date_id):
             raise ErreurMaison("Date introuvable", 404)
     return {"ok": True}
+
+
+@routeur.get("/messages")
+def messages():
+    with ouvrir() as conn:
+        rappel = " · ".join(item["titre"] for item in rappels.rappels(conn)[:3])
+        return {"messages": assistant.histoires(conn), "aujourd_hui": rappel}
+
+
+@routeur.post("/messages")
+def envoyer_message(corps: DireCorps):
+    if not corps.texte.strip():
+        raise ErreurMaison("Dis quelque chose")
+    with ouvrir() as conn:
+        reponse = assistant.discuter(conn, corps.texte, corps.auteur)
+        return {"reponse": reponse, "messages": assistant.histoires(conn)}
+
+
+@routeur.post("/messages/photo")
+async def photo_message(
+    photo: UploadFile = File(...),
+    texte: str = Form(default=""),
+    auteur: str = Form(default=""),
+):
+    nom_photo = enregistrer_image(await photo.read())
+    with ouvrir() as conn:
+        reponse = assistant.repondre_photo(
+            conn, config.chemin_uploads() / nom_photo, nom_photo, texte, auteur,
+        )
+        return {"reponse": reponse, "messages": assistant.histoires(conn)}
 
 
 @routeur.post("/exemple")
