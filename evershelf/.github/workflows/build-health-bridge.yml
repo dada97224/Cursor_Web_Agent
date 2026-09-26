@@ -1,0 +1,101 @@
+name: Build & Release Health Bridge APK
+
+# Publish only from main (avoids develop/main racing on the same release tags).
+# Node 20 deprecation warnings from action majors are harmless; failure was tag/release race.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'evershelf-health-bridge/**'
+      - '.github/workflows/build-health-bridge.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Health Bridge APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5.6.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Get version name
+        id: version
+        run: |
+          VERSION=$(grep 'versionName' evershelf-health-bridge/app/build.gradle.kts | grep -oP '"\K[^"]+' | head -1)
+          VCODE=$(grep 'versionCode' evershelf-health-bridge/app/build.gradle.kts | grep -oP '\d+' | head -1)
+          echo "name=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "code=$VCODE" >> "$GITHUB_OUTPUT"
+          echo "Health Bridge version: $VERSION (versionCode $VCODE)"
+
+      - name: Build release APK
+        working-directory: evershelf-health-bridge
+        run: |
+          rm -f local.properties
+          gradle assembleRelease --no-daemon
+
+      - name: Rename APK
+        run: |
+          mkdir -p artifacts
+          cp evershelf-health-bridge/app/build/outputs/apk/release/app-release.apk \
+            artifacts/evershelf-health-bridge.apk
+          ls -lh artifacts/evershelf-health-bridge.apk
+
+      - name: Publish GitHub releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.name }}"
+          VCODE="${{ steps.version.outputs.code }}"
+          TAG="health-bridge-${VERSION}"
+          SHA="${{ github.sha }}"
+          REPO="${{ github.repository }}"
+
+          # Delete release by ID (works even when tag is broken / 422 on gh release delete)
+          delete_release_tag() {
+            local tag="$1"
+            local id
+            id=$(gh api "repos/${REPO}/releases/tags/${tag}" --jq .id 2>/dev/null || true)
+            if [ -n "${id}" ]; then
+              gh api -X DELETE "repos/${REPO}/releases/${id}" >/dev/null 2>&1 || true
+            fi
+            git push origin ":refs/tags/${tag}" 2>/dev/null || true
+          }
+
+          delete_release_tag "$TAG"
+          delete_release_tag "health-bridge-latest"
+          sleep 3
+
+          gh release create "$TAG" \
+            --target "$SHA" \
+            --title "EverShelf Health Bridge v${VERSION}" \
+            --notes "Android gateway for Fuel Mode. Pair via QR from EverShelf → Settings → Health (URL + token). Android 9+ / Health Connect." \
+            artifacts/evershelf-health-bridge.apk
+
+          gh release create health-bridge-latest \
+            --target "$SHA" \
+            --title "EverShelf Health Bridge Latest" \
+            --notes "Alias → ${TAG} (versionCode ${VCODE})" \
+            --prerelease \
+            artifacts/evershelf-health-bridge.apk
+
+          echo "Published ${TAG} and health-bridge-latest → ${SHA}"
