@@ -3,3 +3,7 @@ __pycache__/
 .pytest_cache/
 *.pyc
 data/
+evershelf/data/*.db
+evershelf/data/*.db-wal
+evershelf/data/*.db-shm
+evershelf/logs/

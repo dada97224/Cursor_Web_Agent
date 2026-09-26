@@ -1,0 +1,2305 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#2d5016">
+    <meta name="author" content="Stimpfl Daniel">
+    <meta name="description" content="Self-hosted pantry manager with barcode scanning, AI identification, and shopping list integration.">
+    <title>EverShelf</title>
+    <link rel="manifest" href="manifest.json">
+    <link rel="icon" type="image/png" href="assets/img/logo/logo_icon.png">
+    <link rel="stylesheet" href="assets/css/style.css?v=20260918a">
+    <link rel="stylesheet" href="assets/css/corporate.css?v=20260709a">
+    <!-- Core modules (auth, DOM helpers) -->
+    <script src="assets/js/core/dom.js?v=20260603a"></script>
+    <script src="assets/js/core/auth.js?v=20260603b"></script>
+    <!-- ZBar WASM — lazy on kiosk WebView (OOM); eager elsewhere -->
+    <script>
+    (function () {
+        var kioskWv = /; wv\)/.test(navigator.userAgent);
+        if (kioskWv) return;
+        document.write('<script src="assets/vendor/zbar/index.js?v=20260606a"><\/script>');
+        document.write('<script>if(window.zbarWasm&&zbarWasm.setModuleArgs){zbarWasm.setModuleArgs({locateFile:function(f){return"assets/vendor/zbar/"+f}});}<\/script>');
+        document.write('<script src="assets/vendor/zbar/polyfill.js?v=20260606a"><\/script>');
+    })();
+    </script>
+    <!-- QuaggaJS — legacy last-resort only -->
+    <script src="assets/vendor/quagga/quagga.min.js?v=20260603a"></script>
+    <script>if(typeof Quagga==='undefined'){document.write('<script src="https://cdn.jsdelivr.net/npm/@ericblade/quagga2@1.8.4/dist/quagga.min.js"><\\/script>');}</script>
+    <!-- @xenova/transformers: ES-module bootstrap that exposes a lazy category-classifier as window._categoryPipelinePromise -->
+    <script type="module">
+        // Lazy-load the embedding pipeline only when first needed.
+        // Using a dynamic import so the ~2 MB WASM is not fetched on page load.
+        window._categoryPipelineReady = false;
+        window._categoryPipelinePromise = null;
+
+        window._getCategoryPipeline = async function() {
+            if (window._categoryPipelinePromise) return window._categoryPipelinePromise;
+            window._categoryPipelinePromise = (async () => {
+                try {
+                    const localBase = 'assets/vendor/transformers/';
+                    const cdnBase = 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/';
+                    const modelProbe = localBase + 'Xenova/all-MiniLM-L6-v2/tokenizer.json';
+                    let pipeline, env;
+                    try {
+                        ({ pipeline, env } = await import(localBase + 'transformers.min.js'));
+                    } catch (_) {
+                        ({ pipeline, env } = await import(cdnBase + 'transformers.min.js'));
+                    }
+                    // Use bundled model files when present; otherwise HuggingFace CDN (no 404 spam)
+                    let localModels = false;
+                    try {
+                        const r = await fetch(modelProbe, { method: 'HEAD' });
+                        localModels = r.ok;
+                    } catch (_) {}
+                    if (localModels) {
+                        env.localModelPath = localBase;
+                        env.allowLocalModels = true;
+                    } else {
+                        env.allowLocalModels = false;
+                    }
+                    env.allowRemoteModels = true;
+                    env.useBrowserCache   = true;
+                    const pipe = await pipeline(
+                        'feature-extraction',
+                        'Xenova/all-MiniLM-L6-v2',
+                        { quantized: true }
+                    );
+                    window._categoryPipelineReady = true;
+                    return pipe;
+                } catch (e) {
+                    console.warn('[EverShelf] Embedding model unavailable, regex fallback only:', e);
+                    return null;
+                }
+            })();
+            return window._categoryPipelinePromise;
+        };
+    </script>
+</head>
+<body>
+
+<!-- ===== APP PRELOADER (hidden by JS once _initApp completes) ===== -->
+<div id="app-preloader" aria-hidden="true">
+    <div class="app-preloader-inner">
+        <img src="assets/img/logo/logo.png" alt="EverShelf" class="app-preloader-logo" />
+        <div class="app-preloader-spinner" id="preloader-spinner"></div>
+        <div id="preloader-progress-wrap" class="preloader-progress-wrap" style="display:none">
+            <div class="preloader-bar-track">
+                <div id="preloader-bar" class="preloader-bar"></div>
+            </div>
+            <div id="check-ticker" class="check-ticker"></div>
+        </div>
+        <div id="preloader-warnings" class="preloader-warnings" style="display:none"></div>
+        <div id="preloader-error-msg" class="preloader-error-msg" style="display:none"></div>
+        <button id="preloader-retry-btn" class="preloader-retry-btn" style="display:none" onclick="_startupRetry()">🔄 <span data-i18n="startup.retry">Riprova</span></button>
+        <span class="app-preloader-version" id="preloader-version">v1.8.5</span>
+    </div>
+</div>
+
+<!-- Top Header -->
+<header class="app-header">
+    <div class="header-content">
+        <!-- Kiosk buttons (exit / refresh) — injected here by _injectKioskOverlay() -->
+        <div class="header-left" id="header-left"></div>
+
+        <!-- Title — left-aligned; grows to fill space -->
+        <div class="header-title-wrap">
+            <h1 class="header-title" onclick="showPage('dashboard')">
+                <img src="assets/img/logo/logo_icon.png" alt="" class="header-logo-icon" aria-hidden="true" /><span data-i18n="nav.title">EverShelf</span><span class="header-version">v1.8.5</span>
+            </h1>
+            <!-- Update badge — shown alongside title, never replaces it -->
+            <span class="header-update-badge" id="header-update-badge" style="display:none"></span>
+        </div>
+
+        <!-- Actions — fixed set of icon buttons, all same size -->
+        <div class="header-actions">
+            <button id="scale-status-indicator" class="header-btn scale-status-indicator scale-status-disconnected"
+                    style="display:none" data-i18n-title="scale.status_disconnected" title="⚖️ Bilancia"
+                    onclick="_scaleShowInfo()">
+                <span class="scale-icon-wrapper">
+                    <span class="scale-icon-emoji">⚖️</span>
+                    <span class="scale-status-dot"></span>
+                </span>
+            </button>
+            <button class="header-btn header-spesa-btn" id="btn-header-spesa"
+                    onclick="toggleSpesaMode()"
+                    data-i18n-title="scan.spesa_quick_hint" data-i18n-aria="scan.spesa_quick_hint"
+                    title="Shopping mode" aria-label="Shopping mode" aria-pressed="false">🛒</button>
+            <button class="header-btn header-scan-btn" id="btn-header-scan"
+                    data-i18n-title="scan.hint_short" title="Scan product">
+                📷
+            </button>
+        </div>
+    </div>
+</header>
+
+<!-- Offline / server-unreachable banner -->
+<div id="offline-banner" class="offline-banner" style="display:none" role="alert" aria-live="assertive">
+    <span class="offline-banner-icon" aria-hidden="true">🔌</span>
+    <span class="offline-banner-text" data-i18n="error.server_offline">Connessione al server persa</span>
+    <button class="offline-banner-retry" onclick="_heartbeatRetry()" data-i18n="error.server_retry">Riprova</button>
+</div>
+
+<!-- Main Content Area -->
+<main class="app-content" id="app-content">
+
+    <!-- ===== DASHBOARD ===== -->
+    <section class="page active" id="page-dashboard">
+        <div class="dashboard-stats" id="dashboard-stats">
+            <div class="stat-card" onclick="showPage('inventory', 'dispensa')">
+                <span class="stat-icon">🗄️</span>
+                <span class="stat-value" id="stat-dispensa">-</span>
+                <span class="stat-label" data-i18n="locations.dispensa">Dispensa</span>
+            </div>
+            <div class="stat-card" onclick="showPage('inventory', 'frigo')">
+                <span class="stat-icon">🧊</span>
+                <span class="stat-value" id="stat-frigo">-</span>
+                <span class="stat-label" data-i18n="locations.frigo">Frigo</span>
+            </div>
+            <div class="stat-card" onclick="showPage('inventory', 'freezer')">
+                <span class="stat-icon">❄️</span>
+                <span class="stat-value" id="stat-freezer">-</span>
+                <span class="stat-label" data-i18n="locations.freezer">Freezer</span>
+            </div>
+            <div class="stat-card" onclick="showPage('shopping')">
+                <span class="stat-icon">🛒</span>
+                <span class="stat-value" id="stat-spesa">-</span>
+                <span class="stat-label" data-i18n="nav.shopping">Spesa</span>
+                <span class="stat-price-total" id="stat-price-total" style="display:none"></span>
+            </div>
+        </div>
+
+        <!-- Top notification banner (anomalous qty + consumption predictions) -->
+        <div id="alert-banner" class="alert-banner" style="display:none">
+            <div class="alert-banner-inner">
+                <div class="alert-banner-icon" id="alert-banner-icon">⚠️</div>
+                <div class="alert-banner-body">
+                    <div class="alert-banner-title" id="alert-banner-title"></div>
+                    <div class="alert-banner-detail" id="alert-banner-detail"></div>
+                </div>
+                <button class="alert-banner-close" id="alert-banner-close" onclick="dismissBannerItem()">✕</button>
+            </div>
+            <div class="alert-banner-actions" id="alert-banner-actions"></div>
+            <div class="alert-banner-counter" id="alert-banner-counter"></div>
+        </div>
+
+        <!-- Quick recipe suggestion -->
+        <div class="quick-recipe-bar" id="quick-recipe-bar" style="display:none">
+            <button class="btn-quick-recipe" onclick="quickRecipeSuggestion()">
+                <span>🍳</span>
+                <span class="quick-recipe-text" data-i18n="dashboard.quick_recipe">🍳 Ricetta veloce con prodotti in scadenza</span>
+                <span>→</span>
+            </button>
+        </div>
+
+        <!-- Alert for expired items (on top) -->
+        <div class="alert-section alert-danger" id="alert-expired" style="display:none">
+            <h3 data-i18n="dashboard.expired_title">🚫 Scaduti</h3>
+            <div id="expired-list"></div>
+        </div>
+
+        <!-- Anti-Waste Report Card + Nutrition Analysis + Monthly Stats (alternating, content rendered by JS) -->
+        <div id="dashboard-insight-wrap" style="position:relative">
+            <div id="waste-chart-section" style="display:none"></div>
+            <div id="nutrition-section" style="display:none"></div>
+            <div id="monthly-stats-section" style="display:none"></div>
+            <div id="macros-section" style="display:none"></div>
+            <div id="spend-section" style="display:none"></div>
+        </div>
+
+        <!-- Alert for soonest expiring items -->
+        <div class="alert-section" id="alert-expiring" style="display:none">
+            <h3 data-i18n="dashboard.expiring_title">⏰ Prossime Scadenze</h3>
+            <div id="expiring-list"></div>
+        </div>
+
+        <!-- Opened (partially used) products -->
+        <div class="alert-section alert-opened" id="alert-opened" style="display:none">
+            <h3 data-i18n="dashboard.opened_title">📦 Prodotti Aperti</h3>
+            <div id="opened-list"></div>
+        </div>
+
+    </section>
+
+    <!-- ===== INVENTORY LIST ===== -->
+    <section class="page" id="page-inventory">
+        <div class="page-header">
+            <button class="back-btn" onclick="goBack()" data-i18n="btn.back">← Indietro</button>
+            <h2 id="inventory-title" data-i18n="inventory.title">Dispensa</h2>
+            <div class="page-header-actions">
+                <button class="page-header-action-btn" onclick="_showImportModal()" title="Import" data-i18n-title="import.btn_title">📥</button>
+                <button class="page-header-action-btn" onclick="_showExportModal()" title="Export" data-i18n-title="export.btn_title">📤</button>
+            </div>
+        </div>
+        <div class="location-tabs" id="location-tabs">
+            <button class="tab active" onclick="filterLocation('')" data-loc="" data-i18n="inventory.filter_all">Tutti</button>
+            <button class="tab" onclick="filterLocation('dispensa')" data-loc="dispensa">🗄️ <span data-i18n="locations.dispensa">Dispensa</span></button>
+            <button class="tab" onclick="filterLocation('frigo')" data-loc="frigo">🧊 <span data-i18n="locations.frigo">Frigo</span></button>
+            <button class="tab" onclick="filterLocation('freezer')" data-loc="freezer">❄️ <span data-i18n="locations.freezer">Freezer</span></button>
+            <button class="tab" onclick="filterLocation('altro')" data-loc="altro">📦 <span data-i18n="locations.altro">Altro</span></button>
+        </div>
+        <div class="search-bar">
+            <input type="text" id="inventory-search" placeholder="🔍 Cerca prodotto..." oninput="filterInventory()" data-i18n-placeholder="inventory.search_placeholder" autocomplete="off">
+            <button type="button" class="search-clear-btn" id="inventory-search-clear" onclick="clearInventorySearch()" hidden aria-label="Cancella ricerca" data-i18n-aria="inventory.clear_search" data-i18n-title="inventory.clear_search" title="Cancella ricerca">×</button>
+        </div>
+        <!-- Quick access: recent & popular products -->
+        <div id="quick-access-section" style="display:none">
+            <div class="quick-access-group" id="quick-recent-group" style="display:none">
+                <h4 class="quick-access-label" data-i18n="inventory.recent_title">🕐 Ultimi usati</h4>
+                <div class="quick-access-grid" id="quick-recent-grid"></div>
+            </div>
+            <div class="quick-access-group" id="quick-popular-group" style="display:none">
+                <h4 class="quick-access-label" data-i18n="inventory.popular_title">⭐ Più usati</h4>
+                <div class="quick-access-grid quick-access-grid-8" id="quick-popular-grid"></div>
+            </div>
+        </div>
+        <div class="inventory-list" id="inventory-list"></div>
+    </section>
+
+    <!-- ===== SCAN PAGE ===== -->
+    <section class="page" id="page-scan">
+        <div class="page-header">
+            <button class="back-btn" onclick="goBack()" data-i18n="btn.back">← Indietro</button>
+            <h2 data-i18n="scan.title">Scansiona</h2>
+            <button class="scan-spesa-chip" id="scan-spesa-btn" onclick="startSpesaMode()" data-i18n="scan.spesa_btn">📷 Continua</button>
+        </div>
+        <div class="spesa-mode-banner" id="spesa-mode-banner" style="display:none">
+            <div class="spesa-banner-left">
+                <span data-i18n="scan.mode_shopping">📷 Scansione continua</span>
+                <span class="spesa-stat"></span>
+            </div>
+            <button class="btn btn-small" onclick="endSpesaMode()" data-i18n="scan.mode_shopping_end">✅ Fine</button>
+        </div>
+        <div class="scan-container">
+            <!-- Camera viewport -->
+            <div class="scanner-viewport" id="scanner-viewport">
+                <!-- Guide corners -->
+                <div class="scan-guide-frame">
+                    <div class="sgf-corner sgf-tl"></div>
+                    <div class="sgf-corner sgf-tr"></div>
+                    <div class="sgf-corner sgf-bl"></div>
+                    <div class="sgf-corner sgf-br"></div>
+                </div>
+                <div class="scanner-overlay">
+                    <div class="scanner-line"></div>
+                </div>
+                <!-- Live partial code preview -->
+                <div class="scan-live-code" id="scan-live-code" style="display:none"></div>
+                <!-- Scan status bar -->
+                <div class="scan-status-bar" id="scan-status-bar">
+                    <span id="scan-status-method" class="scan-status-method"></span>
+                    <span id="scan-status-msg" class="scan-status-msg" data-i18n="scan.status_ready"></span>
+                </div>
+                <!-- AI processing overlay (shown when Gemini Vision is analyzing) -->
+                <div class="scan-ai-overlay" id="scan-ai-overlay" style="display:none">
+                    <div class="scan-ai-overlay-inner">
+                        <div class="loading-spinner"></div>
+                        <span class="scan-ai-overlay-label" data-i18n="scan.ai_overlay_label">Gemini Vision</span>
+                        <span class="scan-ai-overlay-msg" id="scan-ai-overlay-msg"></span>
+                    </div>
+                </div>
+                <!-- Success flash overlay -->
+                <div class="scan-confirm-overlay" id="scan-confirm-overlay" style="display:none">
+                    <div class="scan-confirm-check">✓</div>
+                    <div class="scan-confirm-name" id="scan-confirm-name"></div>
+                </div>
+                <!-- Viewport inline controls (torch / zoom badge / flip) -->
+                <div class="scan-viewport-controls">
+                    <div class="scan-viewport-left">
+                        <button class="scan-ctrl-btn" id="scan-torch-btn" onclick="toggleTorch()" data-i18n-title="scan.torch_hint" title="Torcia">🔦</button>
+                        <button class="scan-ctrl-btn scan-spesa-quick-btn" id="scan-spesa-quick-btn"
+                                onclick="toggleSpesaModeFromCamera()"
+                                data-i18n-title="scan.spesa_quick_hint" data-i18n-aria="scan.spesa_quick_hint"
+                                title="Shopping mode" aria-label="Shopping mode">🛒</button>
+                    </div>
+                    <span class="scan-zoom-badge">2×</span>
+                    <button class="scan-ctrl-btn" id="scan-flip-btn" onclick="flipCamera()" data-i18n-title="scan.flip_hint" title="Cambia fotocamera">🔄</button>
+                </div>
+                <video id="scanner-video" autoplay playsinline></video>
+                <canvas id="scanner-canvas" style="display:none"></canvas>
+            </div>
+
+            <!-- Scan errors -->
+            <div class="scan-result" id="scan-result" style="display:none"></div>
+
+            <!-- Manual AI identification (only when user taps — never automatic) -->
+            <button class="btn btn-accent scan-ai-manual-btn" id="scan-ai-manual-btn" type="button" style="display:none" onclick="_triggerManualAiScan()" data-i18n="scan.ai_manual_btn">🤖 Identifica con AI</button>
+
+            <!-- Spesa session: products scanned/added this trip (editable) -->
+            <div class="spesa-session-list" id="spesa-session-list" style="display:none" aria-live="polite"></div>
+
+            <!-- Recent scans -->
+            <div class="scan-recents" id="scan-recents" style="display:none">
+                <span class="scan-recents-label" data-i18n="scan.recents_label">Recenti</span>
+                <div class="scan-recents-chips" id="scan-recents-chips"></div>
+            </div>
+
+            <!-- Input panel with tabs -->
+            <div class="scan-input-panel">
+                <div class="scan-input-tabs">
+                    <button class="scan-input-tab active" id="scan-tab-barcode" onclick="switchScanTab('barcode')">
+                        <span>📊</span><span data-i18n="scan.tab_barcode">Barcode</span>
+                    </button>
+                    <button class="scan-input-tab" id="scan-tab-name" onclick="switchScanTab('name')">
+                        <span>✏️</span><span data-i18n="scan.tab_name">Nome</span>
+                    </button>
+                    <button class="scan-input-tab" id="scan-tab-ai" onclick="switchScanTab('ai')">
+                        <span>🤖</span><span data-i18n="scan.tab_ai">AI</span>
+                    </button>
+                </div>
+                <!-- Tab: Barcode manuale -->
+                <div class="scan-tab-content" id="scan-tabcontent-barcode">
+                    <div class="barcode-input-row">
+                        <input type="text" id="manual-barcode-input" class="form-input"
+                               inputmode="numeric" pattern="[0-9]*" maxlength="14"
+                               oninput="autoSubmitEAN(this)"
+                               onkeydown="if(event.key==='Enter')submitManualBarcode()"
+                               data-i18n-placeholder="scan.barcode_placeholder"
+                               placeholder="Inserisci codice a barre...">
+                        <button class="btn btn-primary" onclick="submitManualBarcode()">🔍</button>
+                    </div>
+                </div>
+                <!-- Tab: Cerca per nome -->
+                <div class="scan-tab-content quick-name-entry" id="scan-tabcontent-name" style="display:none">
+                    <div class="barcode-input-row">
+                        <input type="text" id="quick-product-name" class="form-input"
+                               autocomplete="off"
+                               onkeydown="if(event.key==='Enter')submitQuickName()"
+                               data-i18n-placeholder="scan.quick_name_placeholder"
+                               placeholder="Es: Mele, Zucchine, Pane...">
+                        <button class="btn btn-accent" onclick="submitQuickName()">✅</button>
+                    </div>
+                </div>
+                <!-- Tab: AI e Manuale -->
+                <div class="scan-tab-content" id="scan-tabcontent-ai" style="display:none">
+                    <div class="scan-ai-tab-btns">
+                        <button class="btn btn-accent" onclick="captureForAI()" data-i18n="scan.ai_identify">🤖 Identifica con AI</button>
+                        <button class="btn btn-secondary" onclick="startManualEntry()" data-i18n="scan.manual_entry">✏️ Inserimento Manuale</button>
+                    </div>
+                    <button class="btn scan-num-ocr-btn" id="scan-num-ocr-btn" style="display:none" onclick="_tryGeminiNumberOCR()" data-i18n="scan.num_ocr_btn">🔢 Leggi numeri con AI</button>
+                </div>
+            </div>
+            <!-- Hidden debug log (accessible via Settings) -->
+            <div id="scan-debug-log" style="display:none;margin-top:12px;padding:10px;background:#1a1a2e;color:#0f0;font-family:monospace;font-size:0.7rem;max-height:200px;overflow-y:auto;border-radius:8px;white-space:pre-wrap"></div>
+        </div>
+    </section>
+
+    <!-- ===== PRODUCT ACTION (IN/OUT after scan) ===== -->
+    <section class="page" id="page-action">
+        <div class="page-header">
+            <button class="back-btn" id="action-back-btn" onclick="goBack()" data-i18n="btn.back">← Indietro</button>
+            <h2 data-i18n="action.title">Cosa vuoi fare?</h2>
+        </div>
+        <!-- Banner: shopping list scan context -->
+        <div id="shopping-scan-target-banner" class="shopping-scan-target-banner" style="display:none"></div>
+        <div class="product-preview product-preview-small" id="action-product-preview"></div>
+        <div class="inventory-status-bar" id="action-inventory-status" style="display:none"></div>
+        <div id="action-related-stock" style="display:none"></div>
+        <div class="action-buttons" id="action-buttons-container">
+            <button class="btn btn-huge btn-success" onclick="showAddForm()">
+                <span class="btn-icon">📥</span>
+                <span class="btn-text"><span data-i18n="action.add_btn">AGGIUNGI</span><br><small data-i18n="action.add_sub">in dispensa/frigo</small></span>
+            </button>
+            <button class="btn btn-huge btn-danger" onclick="showUseForm()">
+                <span class="btn-icon">📤</span>
+                <span class="btn-text"><span data-i18n="action.use_btn">USA / CONSUMA</span><br><small data-i18n="action.use_sub">dalla dispensa/frigo</small></span>
+            </button>
+        </div>
+    </section>
+
+    <!-- ===== ADD TO INVENTORY FORM ===== -->
+    <section class="page" id="page-add">
+        <div class="page-header">
+            <button class="back-btn" onclick="goBack()" data-i18n="btn.back">← Indietro</button>
+            <h2 data-i18n="add.title">Aggiungi alla Dispensa</h2>
+        </div>
+        <div class="product-preview-small" id="add-product-preview"></div>
+        <form class="form" onsubmit="submitAdd(event)">
+            <div class="form-group">
+                <label data-i18n="add.location_label">📍 Dove lo metti?</label>
+                <div class="location-selector">
+                    <button type="button" class="loc-btn active" onclick="selectLocation(this, 'dispensa')">🗄️ <span data-i18n="locations.dispensa">Dispensa</span></button>
+                    <button type="button" class="loc-btn" onclick="selectLocation(this, 'frigo')">🧊 <span data-i18n="locations.frigo">Frigo</span></button>
+                    <button type="button" class="loc-btn" onclick="selectLocation(this, 'freezer')">❄️ <span data-i18n="locations.freezer">Freezer</span></button>
+                    <button type="button" class="loc-btn" onclick="selectLocation(this, 'altro')">📦 <span data-i18n="locations.altro">Altro</span></button>
+                </div>
+                <input type="hidden" id="add-location" value="dispensa">
+            </div>
+            <div class="form-group">
+                <label data-i18n="add.quantity_label">📦 Quantità</label>
+                <div class="qty-unit-row">
+                    <div class="qty-control flex-1">
+                        <button type="button" class="qty-btn" onclick="adjustAddQty(-1)">−</button>
+                        <input type="number" id="add-quantity" value="1" min="0.1" step="any" class="qty-input">
+                        <button type="button" class="qty-btn" onclick="adjustAddQty(1)">+</button>
+                    </div>
+                    <span class="qty-unit-badge qty-unit-muted" id="add-quantity-unit" aria-live="polite">pz</span>
+                    <select id="add-unit" class="form-input unit-select" onchange="onAddUnitChange()">
+                        <option value="pz">pz</option>
+                        <option value="conf">conf</option>
+                        <option value="g">g</option>
+                        <option value="ml">ml</option>
+                    </select>
+                </div>
+                <button type="button" id="btn-scale-add" class="btn btn-secondary scale-read-btn" style="display:none" onclick="readScaleWeight('add-quantity', function(){ return document.getElementById('add-unit').value; })" data-i18n="scale.read_btn">⚖️ Leggi dalla bilancia</button>
+                <div id="add-conf-size-row" class="conf-size-row" style="display:none">
+                    <label class="conf-size-label" data-i18n="add.conf_size_label">📦 Ogni confezione contiene:</label>
+                    <div class="conf-size-inputs">
+                        <input type="number" id="add-conf-size" class="form-input conf-size-input" min="1" step="any" placeholder="es. 300">
+                        <select id="add-conf-unit" class="form-input conf-size-unit">
+                            <option value="g">g</option>
+                            <option value="ml">ml</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="add-weight-info" class="form-hint" style="display:none"></div>
+            </div>
+            <div class="form-group" id="add-vacuum-group">
+                <label class="toggle-row" onclick="toggleVacuumSealed()">
+                    <span data-i18n="add.vacuum_label">🫙 Sotto vuoto</span>
+                    <span class="toggle-switch" id="add-vacuum-toggle">
+                        <input type="checkbox" id="add-vacuum-sealed" onchange="onVacuumSealedChange()">
+                        <span class="toggle-slider"></span>
+                    </span>
+                </label>
+                <p class="form-hint" id="add-vacuum-hint" style="display:none" data-i18n="add.vacuum_hint">La scadenza verrà estesa automaticamente</p>
+            </div>
+            <div class="form-group" id="add-expiry-section">
+                <!-- Populated dynamically by showAddForm() -->
+            </div>
+            <button type="submit" id="btn-add-submit" class="btn btn-large btn-success full-width move-countdown-btn" data-i18n="add.submit">✅ Aggiungi</button>
+        </form>
+    </section>
+
+    <!-- ===== USE FROM INVENTORY FORM ===== -->
+    <section class="page" id="page-use">
+        <div class="page-header">
+            <button class="back-btn" onclick="goBack()" data-i18n="btn.back">← Indietro</button>
+            <h2 data-i18n="use.title">Usa / Consuma</h2>
+        </div>
+        <div class="product-preview-small" id="use-product-preview"></div>
+        <div class="use-inventory-info" id="use-inventory-info"></div>
+        <div id="use-expiry-hint" style="display:none"></div>
+        <form class="form" onsubmit="submitUse(event)">
+            <div class="form-group" id="use-location-group">
+                <label data-i18n="use.location_label">📍 Da dove?</label>
+                <div class="location-selector" id="use-location-selector">
+                    <button type="button" class="loc-btn active" onclick="selectUseLocation(this, 'dispensa')">🗄️ <span data-i18n="locations.dispensa">Dispensa</span></button>
+                    <button type="button" class="loc-btn" onclick="selectUseLocation(this, 'frigo')">🧊 <span data-i18n="locations.frigo">Frigo</span></button>
+                    <button type="button" class="loc-btn" onclick="selectUseLocation(this, 'freezer')">❄️ <span data-i18n="locations.freezer">Freezer</span></button>
+                    <button type="button" class="loc-btn" onclick="selectUseLocation(this, 'altro')">📦 <span data-i18n="locations.altro">Altro</span></button>
+                </div>
+                <input type="hidden" id="use-location" value="dispensa">
+            </div>
+            <div class="form-group">
+                <label data-i18n="use.quantity_label">Quanto hai usato?</label>
+                <button type="button" id="btn-scale-use" class="btn btn-secondary scale-read-btn" style="display:none" onclick="readScaleWeight('use-quantity', function(){ return _useNormalUnit || 'g'; })" data-i18n="scale.read_btn">⚖️ Leggi dalla bilancia</button>
+                <!-- Live scale weight box (visible when scale connected and unit is g/ml) -->
+                <div id="scale-live-box" class="scale-live-box" style="display:none">
+                    <span class="scale-live-icon">⚖️</span>
+                    <div class="scale-live-content">
+                        <div id="scale-live-val" class="scale-live-val">&#8212; &#8212;</div>
+                        <div class="scale-live-progress"><div id="scale-live-progress-bar" class="scale-live-progress-bar"></div></div>
+                        <div id="scale-live-label" class="scale-live-label"></div>
+                    </div>
+                </div>
+                <div class="use-unit-switch" id="use-unit-switch" style="display:none">
+                    <button type="button" class="use-unit-btn active" id="use-unit-sub" onclick="switchUseUnit('sub')"></button>
+                    <button type="button" class="use-unit-btn" id="use-unit-conf" onclick="switchUseUnit('conf')" data-i18n="units.boxes">Confezioni</button>
+                </div>
+                <div class="use-options">
+                    <button type="button" class="btn btn-large btn-danger full-width use-all-btn" onclick="submitUseAll()" data-i18n="use.use_all">
+                        🗑️ Usato TUTTO / Finito
+                    </button>
+                    <div class="use-partial">
+                        <p id="use-partial-hint" data-i18n="use.partial_hint">Oppure specifica la quantità usata:</p>
+                        <div class="qty-control-with-unit">
+                            <div class="qty-control">
+                                <button type="button" class="qty-btn" id="use-qty-minus" onclick="adjustUseQty(-1)">−</button>
+                                <input type="number" id="use-quantity" value="1" min="0.1" step="any" class="qty-input"
+                                       oninput="_scaleUserDismissed=true; _cancelScaleTimersOnly();">
+                                <button type="button" class="qty-btn" id="use-qty-plus" onclick="adjustUseQty(1)">+</button>
+                            </div>
+                            <span class="qty-unit-badge" id="use-quantity-unit" aria-live="polite">—</span>
+                        </div>
+                        <button type="submit" id="btn-use-submit" class="btn btn-large btn-warning full-width mt-2 move-countdown-btn" data-i18n="use.submit">📤 Usa questa quantità</button>
+                        <p id="use-idle-hint" class="form-hint use-idle-hint" style="display:none" aria-live="polite"></p>
+                    </div>
+                </div>
+            </div>
+
+        </form>
+        <button type="button" id="btn-use-recipe" class="btn btn-large btn-accent full-width mt-2 btn-recipe-from-ingredient"
+            onclick="startRecipeFromProduct()" data-i18n="inventory.item_detail_recipe">🍳 Crea ricetta</button>
+    </section>
+
+    <!-- ===== MANUAL / EDIT PRODUCT FORM ===== -->
+    <section class="page" id="page-product-form">
+        <div class="page-header">
+            <button class="back-btn" onclick="goBack()" data-i18n="btn.back">← Indietro</button>
+            <h2 id="product-form-title">Nuovo Prodotto</h2>
+        </div>
+        <form class="form" onsubmit="submitProduct(event)">
+            <input type="hidden" id="pf-id">
+            <div id="pf-ai-fill-row" class="form-group">
+                <button type="button" class="btn btn-accent full-width" onclick="captureForAIFormFill()" data-i18n="product.ai_fill">
+                    📷 Scatta foto e identifica con AI
+                </button>
+                <p class="form-hint" style="text-align:center;margin-top:4px" data-i18n="product.ai_fill_hint">L'AI compilerà automaticamente i campi del prodotto</p>
+            </div>
+            <div class="form-group">
+                <label data-i18n="product.name_label">🏷️ Nome Prodotto *</label>
+                <input type="text" id="pf-name" class="form-input" required placeholder="Es: Latte intero, Pasta penne rigate..."
+                    list="common-products" autocomplete="off" data-i18n-placeholder="product.name_placeholder">
+                <datalist id="common-products">
+                    <option value="Latte intero">
+                    <option value="Latte parzialmente scremato">
+                    <option value="Latte scremato">
+                    <option value="Yogurt bianco">
+                    <option value="Yogurt greco">
+                    <option value="Mozzarella">
+                    <option value="Burrata">
+                    <option value="Parmigiano Reggiano">
+                    <option value="Grana Padano">
+                    <option value="Ricotta">
+                    <option value="Mascarpone">
+                    <option value="Burro">
+                    <option value="Panna fresca">
+                    <option value="Uova">
+                    <option value="Prosciutto cotto">
+                    <option value="Prosciutto crudo">
+                    <option value="Bresaola">
+                    <option value="Salame">
+                    <option value="Mortadella">
+                    <option value="Petto di pollo">
+                    <option value="Macinato di manzo">
+                    <option value="Salmone fresco">
+                    <option value="Tonno in scatola">
+                    <option value="Sgombro in scatola">
+                    <option value="Pasta spaghetti">
+                    <option value="Pasta penne rigate">
+                    <option value="Pasta fusilli">
+                    <option value="Riso">
+                    <option value="Riso basmati">
+                    <option value="Farina 00">
+                    <option value="Pane fresco">
+                    <option value="Pan carrè">
+                    <option value="Fette biscottate">
+                    <option value="Passata di pomodoro">
+                    <option value="Pomodori pelati">
+                    <option value="Olio extravergine d'oliva">
+                    <option value="Aceto balsamico">
+                    <option value="Sale fino">
+                    <option value="Zucchero">
+                    <option value="Caffè macinato">
+                    <option value="Biscotti">
+                    <option value="Nutella">
+                    <option value="Marmellata">
+                    <option value="Miele">
+                    <option value="Cereali">
+                    <option value="Lenticchie">
+                    <option value="Ceci">
+                    <option value="Fagioli">
+                    <option value="Insalata mista">
+                    <option value="Pomodori">
+                    <option value="Zucchine">
+                    <option value="Patate">
+                    <option value="Cipolle">
+                    <option value="Mele">
+                    <option value="Banane">
+                    <option value="Arance">
+                    <option value="Acqua naturale">
+                    <option value="Succo d'arancia">
+                    <option value="Birra">
+                    <option value="Vino rosso">
+                </datalist>
+            </div>
+            <div class="form-group">
+                <label data-i18n="product.brand_label">🏢 Marca</label>
+                <input type="text" id="pf-brand" class="form-input" placeholder="Es: Barilla, Granarolo, Mutti..."
+                    list="common-brands" autocomplete="off" data-i18n-placeholder="product.brand_placeholder">
+                <datalist id="common-brands">
+                    <option value="Barilla">
+                    <option value="De Cecco">
+                    <option value="Rummo">
+                    <option value="Voiello">
+                    <option value="Divella">
+                    <option value="Granarolo">
+                    <option value="Parmalat">
+                    <option value="Müller">
+                    <option value="Danone">
+                    <option value="Galbani">
+                    <option value="Ferrero">
+                    <option value="Lavazza">
+                    <option value="Illy">
+                    <option value="Mulino Bianco">
+                    <option value="Pan di Stelle">
+                    <option value="Mutti">
+                    <option value="Cirio">
+                    <option value="De Rica">
+                    <option value="Star">
+                    <option value="Knorr">
+                    <option value="Findus">
+                    <option value="4 Salti in Padella">
+                    <option value="Rio Mare">
+                    <option value="Valfrutta">
+                    <option value="Auricchio">
+                    <option value="Zanetti">
+                    <option value="Beretta">
+                    <option value="Rovagnati">
+                    <option value="Amadori">
+                    <option value="AIA">
+                    <option value="Esselunga">
+                    <option value="Conad">
+                    <option value="Coop">
+                </datalist>
+            </div>
+            <div class="form-group">
+                <label data-i18n="product.category_label">📂 Categoria</label>
+                <select id="pf-category" class="form-input" onchange="onCategoryChange(false)">
+                    <option value="" data-i18n="form.select_placeholder">-- Seleziona --</option>
+                    <option value="latticini" data-i18n="categories.latticini">🥛 Latticini</option>
+                    <option value="carne" data-i18n="categories.carne">🥩 Carne</option>
+                    <option value="pesce" data-i18n="categories.pesce">🐟 Pesce</option>
+                    <option value="frutta" data-i18n="categories.frutta">🍎 Frutta</option>
+                    <option value="verdura" data-i18n="categories.verdura">🥬 Verdura</option>
+                    <option value="pasta" data-i18n="categories.pasta">🍝 Pasta & Riso</option>
+                    <option value="pane" data-i18n="categories.pane">🍞 Pane & Forno</option>
+                    <option value="surgelati" data-i18n="categories.surgelati">🧊 Surgelati</option>
+                    <option value="bevande" data-i18n="categories.bevande">🥤 Bevande</option>
+                    <option value="condimenti" data-i18n="categories.condimenti">🧂 Condimenti</option>
+                    <option value="snack" data-i18n="categories.snack">🍪 Snack & Dolci</option>
+                    <option value="conserve" data-i18n="categories.conserve">🥫 Conserve</option>
+                    <option value="cereali" data-i18n="categories.cereali">🌾 Cereali & Legumi</option>
+                    <option value="igiene" data-i18n="categories.igiene">🧴 Igiene</option>
+                    <option value="pulizia" data-i18n="categories.pulizia">🧹 Pulizia Casa</option>
+                    <option value="altro" data-i18n="categories.altro">📦 Altro</option>
+                </select>
+            </div>
+            <div class="form-row">
+                <div class="form-group flex-1">
+                    <label data-i18n="product.unit_label">📏 Unità di misura</label>
+                    <select id="pf-unit" class="form-input" onchange="onPfUnitChange()">
+                        <option value="pz" data-i18n="units.pieces">Pezzi</option>
+                        <option value="g" data-i18n="units.grams">Grammi</option>
+                        <option value="ml">ml</option>
+                        <option value="conf" data-i18n="units.box">Confezione</option>
+                    </select>
+                </div>
+                <div class="form-group flex-1">
+                    <label data-i18n="product.default_qty_label">🔢 Quantità default</label>
+                    <input type="number" id="pf-defqty" class="form-input" value="1" min="0.1" step="any">
+                </div>
+            </div>
+            <div id="pf-conf-size-row" class="conf-size-row" style="display:none">
+                <label class="conf-size-label" data-i18n="product.conf_size_label">📦 Ogni confezione contiene:</label>
+                <div class="conf-size-inputs">
+                    <input type="number" id="pf-conf-size" class="form-input conf-size-input" min="1" step="any" placeholder="es. 300">
+                    <select id="pf-conf-unit" class="form-input conf-size-unit">
+                        <option value="g">g</option>
+                        <option value="ml">ml</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label data-i18n="product.notes_label">📝 Note</label>
+                <textarea id="pf-notes" class="form-input" rows="2" placeholder="Es: senza lattosio, bio, conservare in frigo dopo apertura..." data-i18n-placeholder="product.notes_placeholder"></textarea>
+            </div>
+            <div class="form-group">
+                <label data-i18n="product.barcode_label">🔖 Barcode</label>
+                <div class="expiry-input-row">
+                    <input type="text" id="pf-barcode" class="form-input" placeholder="Codice a barre (se disponibile)" inputmode="numeric" data-i18n-placeholder="product.barcode_placeholder">
+                    <button type="button" class="btn btn-accent btn-scan-expiry" id="pf-barcode-scan-btn" onclick="scanBarcodeForForm()" title="Scansiona barcode">📷</button>
+                </div>
+                <p class="form-hint" id="pf-barcode-hint" style="display:none" data-i18n="product.barcode_hint">⚠️ Aggiungi il barcode così al prossimo acquisto basta scansionarlo!</p>
+            </div>
+            <input type="hidden" id="pf-image">
+            <div class="product-image-preview" id="pf-image-preview" style="display:none">
+                <img id="pf-image-img" src="" alt="Product">
+            </div>
+            <button type="submit" class="btn btn-large btn-primary full-width" data-i18n="btn.save_product">💾 Salva Prodotto</button>
+        </form>
+    </section>
+
+    <!-- ===== ALL PRODUCTS PAGE ===== -->
+    <section class="page" id="page-products">
+        <div class="page-header">
+            <button class="back-btn" onclick="goBack()" data-i18n="btn.back">← Indietro</button>
+            <h2 data-i18n="products.title">📦 Tutti i Prodotti</h2>
+        </div>
+        <div class="search-bar">
+            <input type="text" id="products-search" placeholder="🔍 Cerca prodotto..." oninput="searchAllProducts()" autocomplete="off">
+            <button type="button" class="search-clear-btn" id="products-search-clear" onclick="clearProductsSearch()" hidden aria-label="Cancella ricerca" data-i18n-aria="inventory.clear_search" data-i18n-title="inventory.clear_search" title="Cancella ricerca">×</button>
+        </div>
+        <div class="products-list" id="products-list"></div>
+    </section>
+
+    <!-- ===== RECIPE PAGE ===== -->
+    <section class="page" id="page-recipe">
+        <div class="page-header">
+            <button class="back-btn" onclick="goBack()" data-i18n="btn.back">← Indietro</button>
+            <h2 data-i18n="recipes.title">🍳 Ricette</h2>
+        </div>
+        <div class="recipe-page-container">
+            <button class="btn btn-large btn-success full-width recipe-generate-btn" onclick="openRecipeDialog()" data-i18n="recipes.generate">
+                ✨ Genera nuova ricetta
+            </button>
+            <div id="recipe-archive" class="recipe-archive"></div>
+        </div>
+    </section>
+
+    <!-- ===== SHOPPING LIST (BRING!) PAGE ===== -->
+    <section class="page" id="page-shopping">
+        <div class="page-header">
+            <button class="back-btn" onclick="goBack()" data-i18n="btn.back">← Indietro</button>
+            <h2 data-i18n="shopping.title">🛒 Lista della Spesa</h2>
+        </div>
+        <div class="shopping-container">
+            <div class="bring-status" id="bring-status">
+                <div class="bring-loading" data-i18n="shopping.bring_loading">Connessione a Bring!...</div>
+            </div>
+
+            <!-- Tab navigation -->
+            <div class="shopping-tabs" id="shopping-tabs" style="display:none">
+                <button class="shopping-tab active" id="tab-acquisto" onclick="switchShoppingTab('acquisto')">
+                    <span data-i18n="shopping.tab_to_buy">🛍️ Da comprare</span> <span class="shopping-tab-count" id="tab-count-acquisto">0</span>
+                </button>
+                <button class="shopping-tab" id="tab-previsione" onclick="switchShoppingTab('previsione')">
+                    <span data-i18n="shopping.tab_forecast">🧠 In previsione</span> <span class="shopping-tab-count" id="tab-count-previsione">0</span>
+                </button>
+            </div>
+
+            <!-- Tab panel: Da comprare -->
+            <div id="tab-panel-acquisto" class="tab-panel-shopping active">
+                <!-- Price summary bar (shown when prices are enabled) -->
+                <div id="shopping-price-bar" style="display:none">
+                    <div class="shopping-price-total-row">
+                        <span class="price-total-label" data-i18n="shopping.price_total_label">💰 Spesa stimata:</span>
+                        <span class="price-total-value" id="price-total-value">–</span>
+                        <button class="btn-price-refresh" id="btn-price-refresh" onclick="fetchAllPrices(false)" title="Aggiorna prezzi">🔄</button>
+                    </div>
+                    <div id="price-loading-bar" style="display:none" class="price-loading-bar">
+                        <div class="price-loading-inner"></div>
+                    </div>
+                </div>
+                <div class="shopping-current" id="shopping-current" style="display:none">
+                    <div id="shopping-plan-days-bar" class="shopping-plan-days-bar">
+                        <div class="shopping-plan-days-text">
+                            <span id="shopping-plan-days-label"></span>
+                            <span id="shopping-plan-days-hint" class="shopping-plan-days-hint"></span>
+                        </div>
+                        <div class="shopping-plan-days-controls">
+                            <label class="shopping-plan-days-input-wrap">
+                                <input type="number" id="shopping-plan-days-input" class="shopping-plan-days-input" min="1" max="30" inputmode="numeric"
+                                    oninput="_debouncedShoppingPlanDaysPreview()" onchange="applyShoppingPlanDays()" aria-label="Giorni pianificazione">
+                                <span data-i18n="shopping.plan_days_unit">gg</span>
+                            </label>
+                            <button type="button" class="shop-plan-reset" id="shopping-plan-days-reset" onclick="resetShoppingPlanDays()" data-i18n="shopping.plan_days_reset">Fine mese</button>
+                        </div>
+                    </div>
+                    <div class="shopping-section-header">
+                        <h3 data-i18n="shopping.section_to_buy">🛍️ Da comprare</h3>
+                        <span class="shopping-count" id="shopping-count">0</span>
+                    </div>
+                    <div class="shopping-items" id="shopping-items"></div>
+                    <div class="shopping-footer" id="shopping-footer" style="display:none">
+                        <span id="shopping-footer-stats"></span>
+                    </div>
+                </div>
+                <div class="shopping-suggestions" id="shopping-suggestions" style="display:none">
+                    <div class="shopping-section-header">
+                        <h3 data-i18n="shopping.suggestions_title">💡 Suggerimenti AI</h3>
+                    </div>
+                    <div class="seasonal-tip" id="seasonal-tip" style="display:none"></div>
+                    <div class="suggestion-items" id="suggestion-items"></div>
+                    <div class="suggestion-actions" id="suggestion-actions" style="display:none">
+                        <button class="btn btn-success" onclick="addSelectedSuggestions()" data-i18n="shopping.bring_add_selected">
+                            ✅ Aggiungi selezionati a Bring!
+                        </button>
+                    </div>
+                </div>
+                <div class="shopping-actions">
+                    <button class="btn btn-large btn-accent" onclick="generateSuggestions()" id="btn-suggest" data-i18n="shopping.suggest_btn">
+                        Suggerisci cosa comprare
+                    </button>
+                    <button class="btn btn-secondary" onclick="openShoppingTemplates()" style="margin-top:4px" data-i18n="templates.btn">
+                        📋 Templates
+                    </button>
+                    <button class="btn btn-secondary" onclick="forceSyncBring()" style="margin-top:4px" data-i18n="shopping.force_sync">
+                        🔄 Forza sincronizzazione Bring!
+                    </button>
+                    <button class="btn btn-secondary" id="btn-fetch-prices" onclick="fetchAllPrices(false)" style="margin-top:4px;display:none" data-i18n="shopping.btn_fetch_prices">
+                        Cerca i prezzi
+                    </button>
+                </div>
+            </div>
+
+            <!-- Tab panel: In previsione -->
+            <div id="tab-panel-previsione" class="tab-panel-shopping">
+                <!-- Smart shopping predictions -->
+                <div class="smart-shopping" id="smart-shopping">
+                    <div class="smart-shopping-empty" id="smart-shopping-empty" style="display:none">
+                        <div class="empty-state" style="padding:30px">
+                            <div class="empty-state-icon">🧠</div>
+                            <p data-i18n-html="shopping.smart_empty">Nessuna previsione disponibile.<br>Aggiungi prodotti alla dispensa per ricevere previsioni intelligenti.</p>
+                        </div>
+                    </div>
+                    <div id="smart-shopping-content">
+                        <div class="shopping-section-header" style="margin-bottom:4px">
+                            <h3 data-i18n="shopping.smart_title">🧠 Previsioni intelligenti</h3>
+                            <span class="shopping-count" id="smart-count">0</span>
+                        </div>
+                        <div class="smart-last-update-row">
+                            <span id="smart-last-update" class="smart-last-update"></span>
+                        </div>
+                        <div class="smart-filter-row" id="smart-filter-row">
+                            <button class="smart-filter active" data-filter="all" onclick="filterSmart('all')" data-i18n="shopping.smart_filter_all">Tutti</button>
+                            <button class="smart-filter" data-filter="critical" onclick="filterSmart('critical')" data-i18n="shopping.smart_filter_critical">🔴 Urgenti</button>
+                            <button class="smart-filter" data-filter="high" onclick="filterSmart('high')" data-i18n="shopping.smart_filter_high">🟠 Presto</button>
+                            <button class="smart-filter" data-filter="medium" onclick="filterSmart('medium')" data-i18n="shopping.smart_filter_medium">🟡 Pianifica</button>
+                            <button class="smart-filter" data-filter="low" onclick="filterSmart('low')" data-i18n="shopping.smart_filter_low">🟢 Previsione</button>
+                        </div>
+                        <div class="smart-items" id="smart-items"></div>
+                        <div class="smart-actions" id="smart-actions" style="display:none">
+                            <button class="btn btn-success full-width" onclick="addSmartToBring()" data-i18n="shopping.smart_add">
+                                🛒 Aggiungi selezionati a Bring!
+                            </button>
+                        </div>
+                        <div style="text-align:center;margin-top:8px">
+                            <button class="btn btn-secondary btn-sm" onclick="forceSyncBring()" id="btn-force-sync" data-i18n="shopping.force_sync">
+                                🔄 Forza sincronizzazione Bring!
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===== AI IDENTIFICATION PAGE ===== -->
+    <section class="page" id="page-ai">
+        <div class="page-header">
+            <button class="back-btn" onclick="goBack()" data-i18n="btn.back">← Indietro</button>
+            <h2 data-i18n="ai.title">🤖 Identificazione AI</h2>
+        </div>
+        <div class="ai-container">
+            <div class="ai-capture" id="ai-capture">
+                <video id="ai-video" autoplay playsinline></video>
+                <canvas id="ai-canvas" style="display:none"></canvas>
+            </div>
+            <div class="ai-preview" id="ai-preview" style="display:none">
+                <img id="ai-image" src="" alt="Captured">
+            </div>
+            <div class="ai-actions">
+                <button class="btn btn-large btn-accent" onclick="takePhotoForAI()" id="ai-capture-btn" data-i18n="ai.capture">
+                    📸 Scatta Foto
+                </button>
+                <button class="btn btn-large btn-secondary" onclick="retakePhotoAI()" id="ai-retake-btn" style="display:none" data-i18n="ai.retake">
+                    🔄 Riscatta
+                </button>
+            </div>
+            <div class="ai-result" id="ai-result" style="display:none"></div>
+            <p class="scan-hint" data-i18n="ai.hint">Scatta una foto del prodotto e l'AI cercherà di identificarlo</p>
+        </div>
+    </section>
+
+    <!-- Storico Page -->
+    <section id="page-log" class="page">
+        <div class="page-header">
+            <h2 data-i18n="log.title">📋 Storico</h2>
+        </div>
+        <div id="log-list" class="log-list"></div>
+        <button class="btn btn-secondary full-width mt-2" id="log-load-more" style="display:none" onclick="loadLog(true)" data-i18n="btn.load_more">
+            Carica altri...
+        </button>
+    </section>
+
+    <!-- ===== SETTINGS PAGE ===== -->
+    <section class="page" id="page-settings">
+        <div class="page-header">
+            <button class="back-btn" onclick="goBack()" data-i18n="btn.back">← Indietro</button>
+            <h2 data-i18n="settings.title">⚙️ Configurazione</h2>
+        </div>
+        <div class="settings-tabs" role="tablist">
+            <button class="settings-tab active" onclick="switchSettingsTab(this, 'tab-general')" data-tab="tab-general" title="Generali"><span class="settings-tab-icon">⚙️</span><span class="settings-tab-text" data-i18n="settings.tab_general">Generali</span></button>
+            <button class="settings-tab" onclick="switchSettingsTab(this, 'tab-api')" data-tab="tab-api" title="API Keys"><span class="settings-tab-icon">🔑</span><span class="settings-tab-text" data-i18n="settings.tab_api">API</span></button>
+            <button class="settings-tab" onclick="switchSettingsTab(this, 'tab-bring')" data-tab="tab-bring" title="Lista spesa"><span class="settings-tab-icon">🛒</span><span class="settings-tab-text" data-i18n="settings.shopping.tab">Spesa</span></button>
+            <button class="settings-tab" onclick="switchSettingsTab(this, 'tab-recipe')" data-tab="tab-recipe" title="Ricette"><span class="settings-tab-icon">🍳</span><span class="settings-tab-text" data-i18n="settings.tab_recipe">Ricette</span></button>
+            <button class="settings-tab" onclick="switchSettingsTab(this, 'tab-health'); loadHealthSettingsTab();" data-tab="tab-health" title="Salute"><span class="settings-tab-icon">🫀</span><span class="settings-tab-text" data-i18n="settings.tab_health">Salute</span></button>
+            <button class="settings-tab" onclick="switchSettingsTab(this, 'tab-mealplan')" data-tab="tab-mealplan" title="Piano Settimanale"><span class="settings-tab-icon">📅</span><span class="settings-tab-text" data-i18n="settings.tab_mealplan">Piano</span></button>
+            <button class="settings-tab" onclick="switchSettingsTab(this, 'tab-appliances')" data-tab="tab-appliances" title="Elettrodomestici"><span class="settings-tab-icon">🔌</span><span class="settings-tab-text" data-i18n="settings.tab_appliances">Cucina</span></button>
+            <button class="settings-tab" onclick="switchSettingsTab(this, 'tab-camera')" data-tab="tab-camera" title="Fotocamera"><span class="settings-tab-icon">📷</span><span class="settings-tab-text" data-i18n="settings.tab_camera">Camera</span></button>
+            <button class="settings-tab" onclick="switchSettingsTab(this, 'tab-security')" data-tab="tab-security" title="Sicurezza"><span class="settings-tab-icon">🔒</span><span class="settings-tab-text" data-i18n="settings.tab_security">Sicurezza</span></button>
+            <button class="settings-tab" onclick="switchSettingsTab(this, 'tab-tts')" data-tab="tab-tts" title="Voce (TTS)"><span class="settings-tab-icon">🔊</span><span class="settings-tab-text" data-i18n="settings.tab_tts">Voce</span></button>
+            <button class="settings-tab" onclick="switchSettingsTab(this, 'tab-ha'); _loadHaTab();" data-tab="tab-ha" title="Home Assistant"><span class="settings-tab-icon">🏠</span><span class="settings-tab-text" data-i18n="settings.ha.tab">HA</span></button>
+            <button class="settings-tab" onclick="switchSettingsTab(this, 'tab-scale')" data-tab="tab-scale" title="Bilancia Smart"><span class="settings-tab-icon">⚖️</span><span class="settings-tab-text" data-i18n="settings.scale.tab">Bilancia</span></button>
+            <button class="settings-tab" onclick="switchSettingsTab(this, 'tab-backup'); _loadBackupTab();" data-tab="tab-backup" title="Backup"><span class="settings-tab-icon">💾</span><span class="settings-tab-text" data-i18n="settings.backup.tab">Backup</span></button>
+            <button class="settings-tab" onclick="switchSettingsTab(this, 'tab-info'); _loadInfoTab();" data-tab="tab-info" title="Info"><span class="settings-tab-icon">ℹ️</span><span class="settings-tab-text" data-i18n="settings.info.tab">Info</span></button>
+        </div>
+        <div class="settings-panels">
+            <!-- Generali Tab -->
+            <div class="settings-panel active" id="tab-general">
+                <div class="settings-card">
+                    <h4 data-i18n="settings.language.title">🌐 Lingua / Language</h4>
+                    <p class="settings-hint" data-i18n="settings.language.hint">Seleziona la lingua dell'interfaccia. Select the interface language.</p>
+                    <div class="form-group">
+                        <select id="setting-language" class="form-input" onchange="changeLanguage(this.value)">
+                        </select>
+                        <p class="settings-hint mt-2" data-i18n="settings.language.restart_notice">La pagina verrà ricaricata per applicare la nuova lingua.</p>
+                    </div>
+                </div>
+                <div class="settings-card">
+                    <h4 data-i18n="settings.info.currency_title">💱 Valuta</h4>
+                    <p class="settings-hint" data-i18n="settings.info.currency_hint">La valuta usata per tutti i costi e i prezzi nell'app.</p>
+                    <div class="form-group" style="margin-top:8px">
+                        <select id="setting-price-currency" class="form-input">
+                            <option value="EUR">€ Euro (EUR)</option>
+                            <option value="USD">$ Dollaro USA (USD)</option>
+                            <option value="GBP">£ Sterlina (GBP)</option>
+                            <option value="CHF">CHF Franco Svizzero</option>
+                            <option value="CAD">CA$ Dollaro Canadese</option>
+                            <option value="AUD">A$ Dollaro Australiano</option>
+                            <option value="BRL">R$ Real Brasiliano</option>
+                            <option value="JPY">¥ Yen Giapponese</option>
+                            <option value="SEK">kr Corona Svedese</option>
+                            <option value="NOK">kr Corona Norvegese</option>
+                            <option value="DKK">kr Corona Danese</option>
+                            <option value="PLN">zł Zloty Polacco</option>
+                        </select>
+                    </div>
+                    <div class="form-group" style="margin-top:10px">
+                        <button class="btn btn-primary" onclick="saveSettings()" data-i18n="btn.save">Salva</button>
+                    </div>
+                </div>
+                <div class="settings-card">
+                    <h4 data-i18n="settings.custom_locations.title">📍 Luoghi di conservazione</h4>
+                    <p class="settings-hint" data-i18n="settings.custom_locations.hint">Aggiungi posti oltre a Dispensa, Frigo, Freezer e Altro (es. Cantina, Garage). I nomi restano così come li scrivi.</p>
+                    <p class="settings-hint" data-i18n="settings.custom_locations.builtin_hint">Predefiniti (non rimovibili): Dispensa, Frigo, Freezer, Altro.</p>
+                    <div class="appliances-list" id="custom-locations-list"></div>
+                    <div class="form-group mt-2">
+                        <div class="barcode-input-row">
+                            <input type="text" id="new-custom-location-input" class="form-input" data-i18n-placeholder="settings.custom_locations.placeholder" placeholder="Es: Cantina, Box garage…" onkeydown="if(event.key==='Enter'){event.preventDefault();addCustomLocation()}">
+                            <button class="btn btn-accent" onclick="addCustomLocation()">➕</button>
+                        </div>
+                    </div>
+                    <div class="form-group" style="margin-top:10px">
+                        <button class="btn btn-primary" onclick="saveSettings()" data-i18n="btn.save">Salva</button>
+                    </div>
+                </div>
+                <div class="settings-card">
+                    <h4 data-i18n="settings.theme.title">🌙 Tema / Aspetto</h4>
+                    <p class="settings-hint" data-i18n="settings.theme.hint">Scegli il tema dell'interfaccia.</p>
+                    <div class="form-group">
+                        <select id="setting-dark-mode" class="form-input" onchange="_setThemeMode(this.value)">
+                            <option value="off" data-i18n="settings.theme.off">☀️ Chiaro</option>
+                            <option value="auto" selected data-i18n="settings.theme.auto">🔄 Automatico (orario)</option>
+                            <option value="on" data-i18n="settings.theme.on">🌙 Scuro</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="settings-card">
+                    <h4 data-i18n="settings.screensaver.card_title">🌙 Salvaschermo</h4>
+                    <p class="settings-hint" data-i18n="settings.screensaver.card_hint">Mostra un orologio con fatti utili dopo un periodo di inattività. Di default è disattivato.</p>
+                    <div class="form-group">
+                        <label class="toggle-row">
+                            <span data-i18n="settings.screensaver.label">Attiva salvaschermo</span>
+                            <span class="toggle-switch">
+                                <input type="checkbox" id="setting-screensaver-enabled">
+                                <span class="toggle-slider"></span>
+                            </span>
+                        </label>
+                    </div>
+                    <div class="form-group" id="screensaver-timeout-row" style="margin-top:10px">
+                        <label for="setting-screensaver-timeout" style="font-size:0.85rem;font-weight:600;color:var(--text-secondary)" data-i18n="settings.screensaver.start_after">⏱️ Avvia dopo</label>
+                        <select id="setting-screensaver-timeout" class="form-input" style="margin-top:6px;max-width:200px">
+                            <option value="1" data-i18n="settings.screensaver.timeout_1">1 minuto</option>
+                            <option value="2" data-i18n="settings.screensaver.timeout_2">2 minuti</option>
+                            <option value="5" selected data-i18n="settings.screensaver.timeout_5">5 minuti</option>
+                            <option value="10" data-i18n="settings.screensaver.timeout_10">10 minuti</option>
+                            <option value="15" data-i18n="settings.screensaver.timeout_15">15 minuti</option>
+                            <option value="30" data-i18n="settings.screensaver.timeout_30">30 minuti</option>
+                            <option value="60" data-i18n="settings.screensaver.timeout_60">1 ora</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="settings-card">
+                    <h4 data-i18n="settings.zerowaste.card_title">♻️ Suggerimenti zero-waste</h4>
+                    <p class="settings-hint" data-i18n="settings.zerowaste.card_hint">Durante la cottura, mostra consigli su come riutilizzare gli scarti prodotti in ogni passo (bucce, acqua di cottura, ecc.). Disattivo per impostazione predefinita.</p>
+                    <div class="form-group">
+                        <label class="toggle-row">
+                            <span data-i18n="settings.zerowaste.label">Mostra suggerimenti durante la cottura</span>
+                            <span class="toggle-switch">
+                                <input type="checkbox" id="setting-zerowaste-tips">
+                                <span class="toggle-slider"></span>
+                            </span>
+                        </label>
+                    </div>
+                </div>
+                <div class="settings-card">
+                    <h4 data-i18n="export.title">📤 Esporta inventario</h4>
+                    <p class="settings-hint" data-i18n="export.hint">Scarica l'inventario corrente in CSV o apri una versione stampabile (PDF).</p>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap">
+                        <button class="btn btn-outline" onclick="exportInventory('csv')" style="flex:1;min-width:120px">
+                            📊 <span data-i18n="export.btn_csv">CSV</span>
+                        </button>
+                        <button class="btn btn-outline" onclick="exportInventory('html')" style="flex:1;min-width:120px">
+                            🖨️ <span data-i18n="export.btn_pdf">PDF / Stampa</span>
+                        </button>
+                    </div>
+                </div>
+                <div class="settings-card">
+                    <h4 data-i18n="import.title">📥 Importa inventario</h4>
+                    <p class="settings-hint" data-i18n="import.hint">Carica un CSV con lo stesso schema dell'export. Anteprima e conferma prima di scrivere.</p>
+                    <button class="btn btn-outline full-width" onclick="_showImportModal()">
+                        📥 <span data-i18n="import.btn_open">Apri importazione</span>
+                    </button>
+                </div>
+            </div>
+            <!-- API Keys Tab -->
+            <div class="settings-panel" id="tab-api">
+                <div class="settings-card">
+                    <h4 data-i18n="settings.ai.title">🤖 Intelligenza artificiale</h4>
+                    <p class="settings-hint" data-i18n="settings.ai.hint">Scegli un solo provider. Se l’AI è disattivata, nessun servizio che la usa funziona.</p>
+                    <div class="form-group">
+                        <label class="toggle-row">
+                            <span data-i18n="settings.ai.enabled_label">Abilita AI</span>
+                            <span class="toggle-switch">
+                                <input type="checkbox" id="setting-ai-enabled" checked onchange="_syncAiProviderUi()">
+                                <span class="toggle-slider"></span>
+                            </span>
+                        </label>
+                    </div>
+                    <div class="form-group" id="ai-provider-group">
+                        <label data-i18n="settings.ai.provider_label">Provider (una sola scelta)</label>
+                        <div class="radio-group" style="margin-top:8px;display:flex;flex-direction:column;gap:8px">
+                            <label class="radio-option">
+                                <input type="radio" name="ai-provider" value="gemini" checked onchange="_onAiProviderChange(this.value)">
+                                <span data-i18n="settings.ai.provider_gemini">Google Gemini</span>
+                            </label>
+                            <label class="radio-option">
+                                <input type="radio" name="ai-provider" value="openai" onchange="_onAiProviderChange(this.value)">
+                                <span data-i18n="settings.ai.provider_openai">OpenAI (cloud)</span>
+                            </label>
+                            <label class="radio-option">
+                                <input type="radio" name="ai-provider" value="llama" onchange="_onAiProviderChange(this.value)">
+                                <span data-i18n="settings.ai.provider_llama">Llama (locale / remoto)</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+                <div class="settings-card" id="settings-ai-gemini-card">
+                    <h4 data-i18n="settings.gemini.title">🤖 Google Gemini</h4>
+                    <p class="settings-hint" data-i18n="settings.gemini.hint">Chiave API per identificazione prodotti, scadenze e ricette.</p>
+                    <div class="form-group">
+                        <label data-i18n="settings.gemini.key_label">API Key Gemini</label>
+                        <input type="password" id="setting-gemini-key" class="form-input" placeholder="AIza...">
+                        <button class="btn btn-small btn-secondary mt-2" onclick="togglePasswordVisibility('setting-gemini-key')" data-i18n="btn.toggle_password">👁️ Mostra/Nascondi</button>
+                    </div>
+                </div>
+                <div class="settings-card" id="settings-ai-openai-card" style="display:none">
+                    <h4 data-i18n="settings.openai.title">☁️ OpenAI</h4>
+                    <p class="settings-hint" data-i18n="settings.openai.hint">Account OpenAI ufficiale. URL predefinito: https://api.openai.com/v1</p>
+                    <div class="form-group">
+                        <label data-i18n="settings.openai.base_url_label">Base URL</label>
+                        <input type="text" id="setting-openai-base-url" class="form-input" placeholder="https://api.openai.com/v1" data-i18n-placeholder="settings.openai.base_url_placeholder">
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.openai.model_label">Modello</label>
+                        <input type="text" id="setting-openai-model" class="form-input" placeholder="gpt-4o-mini">
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.openai.key_label">API key</label>
+                        <input type="password" id="setting-openai-api-key" class="form-input" placeholder="sk-…">
+                        <button class="btn btn-small btn-secondary mt-2" onclick="togglePasswordVisibility('setting-openai-api-key')" data-i18n="btn.toggle_password">👁️ Mostra/Nascondi</button>
+                    </div>
+                </div>
+                <div class="settings-card" id="settings-ai-llama-card" style="display:none">
+                    <h4 data-i18n="settings.llama.title">🦙 Llama (locale / remoto)</h4>
+                    <p class="settings-hint" data-i18n="settings.llama.hint">Server OpenAI-compatibile: Ollama, llama.cpp, vLLM… locale o su un’altra macchina in rete.</p>
+                    <div class="form-group">
+                        <label data-i18n="settings.llama.base_url_label">Base URL</label>
+                        <input type="text" id="setting-llama-base-url" class="form-input" placeholder="http://127.0.0.1:11434/v1" data-i18n-placeholder="settings.llama.base_url_placeholder">
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.llama.model_label">Modello</label>
+                        <input type="text" id="setting-llama-model" class="form-input" placeholder="llama3.2">
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.llama.key_label">API key (opzionale)</label>
+                        <input type="password" id="setting-llama-api-key" class="form-input" placeholder="">
+                        <button class="btn btn-small btn-secondary mt-2" onclick="togglePasswordVisibility('setting-llama-api-key')" data-i18n="btn.toggle_password">👁️ Mostra/Nascondi</button>
+                    </div>
+                </div>
+                <div class="settings-card" id="settings-ai-test-card">
+                    <h4 data-i18n="settings.ai.test_title">🔌 Test connessione</h4>
+                    <p class="settings-hint" data-i18n="settings.ai.test_hint">Invia una richiesta minima al provider selezionato e misura il tempo di risposta.</p>
+                    <button type="button" class="btn btn-accent" id="btn-ai-test" onclick="testAiConnection()" data-i18n="settings.ai.test_btn">▶ Esegui test</button>
+                    <div id="ai-test-result" class="settings-hint" style="margin-top:10px;display:none" role="status" aria-live="polite"></div>
+                </div>
+            </div>
+            <!-- Bring! Tab -->
+            <div class="settings-panel" id="tab-bring">
+                <!-- Shopping enable + provider -->
+                <div class="settings-card">
+                    <h4 data-i18n="settings.shopping.title">🛒 Lista della spesa</h4>
+                    <p class="settings-hint" data-i18n="settings.shopping.hint">EverShelf ha la propria lista della spesa. Bring! è opzionale e fa solo da mirror.</p>
+                    <div class="form-group">
+                        <label class="toggle-row">
+                            <span data-i18n="settings.shopping.enable_label">Abilita lista della spesa</span>
+                            <span class="toggle-switch">
+                                <input type="checkbox" id="setting-shopping-enabled" onchange="onShoppingEnabledChange()">
+                                <span class="toggle-slider"></span>
+                            </span>
+                        </label>
+                    </div>
+                    <div class="form-group" id="shopping-mode-group">
+                        <label data-i18n="settings.shopping.mode_label">Provider</label>
+                        <div class="radio-group" style="margin-top:6px">
+                            <label class="radio-option">
+                                <input type="radio" name="shopping-mode" value="internal" onchange="onShoppingModeChange(this.value)">
+                                <span data-i18n="settings.shopping.mode_internal">EverShelf (lista integrata)</span>
+                            </label>
+                            <label class="radio-option" style="margin-left:16px">
+                                <input type="radio" name="shopping-mode" value="bring" onchange="onShoppingModeChange(this.value)">
+                                <span data-i18n="settings.shopping.mode_bring">Mirror su Bring! (opzionale)</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+                <!-- Bring! sub-section (shown only when mode = bring) -->
+                <div class="settings-card" id="bring-subsection" style="display:none;margin-top:12px">
+                    <h4 data-i18n="settings.shopping.bring_section_title">Configurazione Bring!</h4>
+                    <div class="form-group">
+                        <label data-i18n="settings.bring.email_label">📧 Email Bring!</label>
+                        <input type="email" id="setting-bring-email" class="form-input" placeholder="email@esempio.com">
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.bring.password_label">🔒 Password Bring!</label>
+                        <input type="password" id="setting-bring-password" class="form-input" placeholder="Password">
+                        <button class="btn btn-small btn-secondary mt-2" onclick="togglePasswordVisibility('setting-bring-password')" data-i18n="btn.toggle_password">👁️ Mostra/Nascondi</button>
+                    </div>
+                </div>
+                <!-- Smart suggestions + forecast -->
+                <div class="settings-card" style="margin-top:12px">
+                    <h4 data-i18n="settings.shopping.ai_section_title">Assistenza AI</h4>
+                    <div class="form-group">
+                        <label class="toggle-row">
+                            <span data-i18n="settings.shopping.smart_suggestions_label">Suggerimenti AI</span>
+                            <span class="toggle-switch">
+                                <input type="checkbox" id="setting-shopping-smart-suggestions">
+                                <span class="toggle-slider"></span>
+                            </span>
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label class="toggle-row">
+                            <span data-i18n="settings.shopping.forecast_label">Previsione prodotti in esaurimento</span>
+                            <span class="toggle-switch">
+                                <input type="checkbox" id="setting-shopping-forecast">
+                                <span class="toggle-slider"></span>
+                            </span>
+                        </label>
+                    </div>
+                    <div class="form-group" style="margin-top:8px">
+                        <label data-i18n="settings.shopping.auto_add_label">Aggiungi automaticamente quando</label>
+                        <div class="qty-control" style="margin-top:6px">
+                            <button type="button" class="qty-btn" onclick="adjustQty('setting-shopping-auto-add', -1, 0, 20)">−</button>
+                            <input type="number" id="setting-shopping-auto-add" value="0" min="0" max="20" class="qty-input">
+                            <button type="button" class="qty-btn" onclick="adjustQty('setting-shopping-auto-add', 1, 0, 20)">+</button>
+                        </div>
+                        <p class="settings-hint" data-i18n="settings.shopping.auto_add_suffix">rimasto in magazzino (0 = solo quando esaurito)</p>
+                    </div>
+                </div>
+                <!-- Price Estimation Settings -->
+                <div class="settings-card" style="margin-top:12px">
+                    <h4 data-i18n="settings.price.title">💰 Stima Prezzi (AI)</h4>
+                    <p class="settings-hint" data-i18n="settings.price.hint">Mostra il costo stimato di ogni prodotto nella lista della spesa usando l'AI.</p>
+                    <div class="form-group">
+                        <label class="toggle-row">
+                            <span data-i18n="settings.price.enabled_label">Attiva stima prezzi</span>
+                            <span class="toggle-switch">
+                                <input type="checkbox" id="setting-price-enabled">
+                                <span class="toggle-slider"></span>
+                            </span>
+                        </label>
+                    </div>
+                    <div id="price-settings-sub" style="display:none">
+                        <div class="form-group">
+                            <label data-i18n="settings.price.country_label">🌍 Paese di riferimento</label>
+                            <select id="setting-price-country" class="form-input" onchange="onPriceCountryChange()">
+                                <option value="Italia">🇮🇹 Italia</option>
+                                <option value="USA">🇺🇸 USA</option>
+                                <option value="Germany">🇩🇪 Germania</option>
+                                <option value="France">🇫🇷 Francia</option>
+                                <option value="Spain">🇪🇸 Spagna</option>
+                                <option value="UK">🇬🇧 Regno Unito</option>
+                                <option value="Switzerland">🇨🇭 Svizzera</option>
+                                <option value="Austria">🇦🇹 Austria</option>
+                                <option value="Netherlands">🇳🇱 Olanda</option>
+                                <option value="Belgium">🇧🇪 Belgio</option>
+                                <option value="Canada">🇨🇦 Canada</option>
+                                <option value="Australia">🇦🇺 Australia</option>
+                                <option value="Brazil">🇧🇷 Brasile</option>
+                                <option value="Japan">🇯🇵 Giappone</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label data-i18n="settings.price.update_label">🔄 Aggiorna prezzi ogni</label>
+                            <div class="qty-control">
+                                <button type="button" class="qty-btn" onclick="adjustQty('setting-price-update-months', -1, 1, 24)">−</button>
+                                <input type="number" id="setting-price-update-months" value="3" min="1" max="24" class="qty-input">
+                                <button type="button" class="qty-btn" onclick="adjustQty('setting-price-update-months', 1, 1, 24)">+</button>
+                            </div>
+                            <span class="settings-hint" style="display:inline;margin-left:8px" data-i18n="settings.price.update_suffix">mesi</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <!-- Recipe Tab -->
+            <div class="settings-panel" id="tab-recipe">
+                <p class="settings-panel-intro" data-i18n="settings.recipe.panel_intro">Motore ricette, Mealie e collegamento con la lista spesa.</p>
+
+                <div class="settings-card">
+                    <h4 data-i18n="settings.recipe.engine_title">🧠 Motore ricette</h4>
+                    <p class="settings-hint" data-i18n="settings.recipe.engine_hint">Scegli da dove EverShelf prende le ricette quando premi «Genera ricetta».</p>
+                    <div class="form-group">
+                        <label data-i18n="settings.mealie.source_label">Motore ricette</label>
+                        <select id="setting-recipe-source" class="form-input" onchange="_updateRecipeEngineHelp()">
+                            <option value="auto" data-i18n="settings.mealie.source_auto">Auto (Mealie se disponibile, altrimenti Gemini)</option>
+                            <option value="mealie" data-i18n="settings.mealie.source_mealie">Solo Mealie (ricettario salvato)</option>
+                            <option value="gemini" data-i18n="settings.mealie.source_gemini">Solo Gemini AI (ricette generate)</option>
+                        </select>
+                    </div>
+                    <div id="recipe-engine-help" class="settings-info-box"></div>
+                </div>
+
+                <div class="settings-card" id="mealie-settings-card">
+                    <h4 data-i18n="settings.mealie.connection_title">🍽️ Mealie — collegamento</h4>
+                    <p class="settings-hint" data-i18n="settings.mealie.hint">Mealie è un ricettario self-hosted. EverShelf cerca tra le tue ricette (anche offline dopo la sync).</p>
+                    <p class="settings-hint" id="mealie-setup-status"></p>
+                    <div id="mealie-install-progress" style="display:none;margin:8px 0 12px">
+                        <div class="settings-progress-track">
+                            <div id="mealie-install-progress-fill" class="settings-progress-fill"></div>
+                        </div>
+                        <p id="mealie-install-progress-text" class="settings-hint" style="margin-top:6px;margin-bottom:0"></p>
+                    </div>
+                    <div class="settings-btn-row">
+                        <button type="button" class="btn btn-secondary" id="btn-mealie-discover" onclick="discoverMealie()" data-i18n="settings.mealie.discover_btn">🔍 Verifica / Discovery</button>
+                        <button type="button" class="btn btn-secondary" id="btn-mealie-install" onclick="installMealie()" data-i18n="settings.mealie.install_btn">⚙️ Installa Mealie</button>
+                        <button type="button" class="btn btn-secondary" id="btn-mealie-sync" onclick="syncMealieCache(true)" data-i18n="settings.mealie.sync_btn">🔄 Sincronizza ricette</button>
+                    </div>
+                    <p class="settings-hint" id="mealie-cache-status"></p>
+                    <details class="settings-details">
+                        <summary data-i18n="settings.mealie.advanced_toggle">⚙️ Opzioni avanzate Mealie</summary>
+                        <div class="settings-details-body">
+                            <div class="form-group">
+                                <label data-i18n="settings.mealie.offline_label">Modalità Mealie</label>
+                                <select id="setting-mealie-offline" class="form-input">
+                                    <option value="auto" data-i18n="settings.mealie.offline_auto">Auto (online + cache offline se non raggiungibile)</option>
+                                    <option value="true" data-i18n="settings.mealie.offline_only">Solo offline (usa cache locale)</option>
+                                    <option value="false" data-i18n="settings.mealie.offline_online">Solo online (sempre API Mealie)</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label data-i18n="settings.mealie.url_label">URL Mealie</label>
+                                <input type="url" id="setting-mealie-url" class="form-input" placeholder="http://127.0.0.1:9925">
+                            </div>
+                            <div class="form-group">
+                                <label data-i18n="settings.mealie.token_label">Token API Mealie</label>
+                                <input type="password" id="setting-mealie-token" class="form-input" placeholder="••••••••">
+                                <button type="button" class="btn btn-small btn-secondary mt-2" onclick="togglePasswordVisibility('setting-mealie-token')" data-i18n="btn.toggle_password">👁️ Mostra/Nascondi</button>
+                            </div>
+                            <div class="form-group">
+                                <label data-i18n="settings.mealie.sync_days_label">Sincronizza cache ogni (giorni)</label>
+                                <input type="number" id="setting-mealie-sync-days" class="form-input" min="1" max="90" value="7">
+                            </div>
+                        </div>
+                    </details>
+                </div>
+
+                <div class="settings-card">
+                    <h4 data-i18n="settings.recipe.shopping_title">🛒 Ricette e lista spesa</h4>
+                    <p class="settings-hint" data-i18n="settings.recipe.shopping_hint">Quando una ricetta (Mealie o Gemini) richiede ingredienti che non hai in dispensa.</p>
+                    <div class="form-group">
+                        <label data-i18n="settings.recipe.shopping_mode_label">Ingredienti mancanti</label>
+                        <select id="setting-recipe-shopping-mode" class="form-input">
+                            <option value="off" data-i18n="settings.recipe.shopping_off">Non suggerire</option>
+                            <option value="suggest" data-i18n="settings.recipe.shopping_suggest">Mostra suggerimenti (conferma manuale)</option>
+                            <option value="auto" data-i18n="settings.recipe.shopping_auto">Aggiungi automaticamente alla lista spesa</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="settings-card">
+                    <h4 data-i18n="settings.recipe.prefs_title">👨‍🍳 Preferenze ricette</h4>
+                    <p class="settings-hint" data-i18n="settings.recipe.hint">Opzioni predefinite per la generazione delle ricette.</p>
+                    <div class="form-group">
+                        <label data-i18n="settings.recipe.persons_label">👥 Persone predefinite</label>
+                        <div class="qty-control">
+                            <button type="button" class="qty-btn" onclick="adjustQty('setting-default-persons', -1)">−</button>
+                            <input type="number" id="setting-default-persons" value="1" min="1" max="20" class="qty-input">
+                            <button type="button" class="qty-btn" onclick="adjustQty('setting-default-persons', 1)">+</button>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.recipe.options_label">🎯 Opzioni ricetta predefinite</label>
+                        <div class="recipe-pref-checks">
+                            <label class="checkbox-label"><input type="checkbox" id="setting-pref-veloce"> <span data-i18n="settings.recipe.fast">⚡ Pasto Veloce</span></label>
+                            <label class="checkbox-label"><input type="checkbox" id="setting-pref-pocafame"> <span data-i18n="settings.recipe.light">🥗 Poca Fame</span></label>
+                            <label class="checkbox-label"><input type="checkbox" id="setting-pref-scadenze"> <span data-i18n="settings.recipe.expiry">⏰ Priorità Scadenze</span></label>
+                            <label class="checkbox-label"><input type="checkbox" id="setting-pref-healthy"> <span data-i18n="settings.recipe.healthy">💚 Extra Salutare</span></label>
+                            <label class="checkbox-label"><input type="checkbox" id="setting-pref-opened"> <span data-i18n="settings.recipe.opened">📦 Priorità Cose Aperte</span></label>
+                            <label class="checkbox-label"><input type="checkbox" id="setting-pref-zerowaste"> <span data-i18n="settings.recipe.zerowaste">♻️ Zero Sprechi</span></label>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.recipe.dietary_label">🚫 Intolleranze / Restrizioni</label>
+                        <textarea id="setting-dietary" class="form-input" rows="2" placeholder="Es: senza glutine, senza lattosio, vegetariano..." data-i18n-placeholder="settings.recipe.dietary_placeholder"></textarea>
+                    </div>
+                </div>
+
+                <div class="settings-card">
+                    <h4 data-i18n="settings.weather.title">🌤 Meteo per «A ritmo mio»</h4>
+                    <p class="settings-hint" data-i18n="settings.weather.hint">Opzionale e disattivo di default. Se attivo, le ricette «A ritmo mio» tengono conto del meteo nella zona scelta (es. caldo → piatti freschi). Dati da Open-Meteo, senza API key.</p>
+                    <div class="form-group" style="margin-bottom:14px">
+                        <label class="toggle-row">
+                            <span data-i18n="settings.weather.enabled">Abilita influenza meteo</span>
+                            <span class="toggle-switch">
+                                <input type="checkbox" id="setting-weather-enabled" onchange="onWeatherEnabledChange()">
+                                <span class="toggle-slider"></span>
+                            </span>
+                        </label>
+                    </div>
+                    <div id="weather-settings-body" class="weather-settings-body" style="opacity:0.45;pointer-events:none">
+                        <div class="form-group">
+                            <label data-i18n="settings.weather.city_label">Città / zona</label>
+                            <div style="display:flex;gap:8px;flex-wrap:wrap">
+                                <input type="text" id="setting-weather-city-search" class="form-input" style="flex:1;min-width:160px" autocomplete="off" data-i18n-placeholder="settings.weather.city_placeholder" placeholder="Es: Milano, Roma…">
+                                <button type="button" class="btn btn-secondary" onclick="searchWeatherCity()" data-i18n="settings.weather.search">Cerca</button>
+                            </div>
+                            <div id="weather-geocode-results" class="weather-geocode-results" style="display:none;margin-top:8px"></div>
+                        </div>
+                        <input type="hidden" id="setting-weather-lat">
+                        <input type="hidden" id="setting-weather-lon">
+                        <input type="hidden" id="setting-weather-city">
+                        <p id="weather-location-label" class="settings-hint" style="margin-top:4px"></p>
+                        <div id="weather-preview" class="settings-hint" style="margin-top:8px"></div>
+                        <p class="settings-hint" style="margin-top:10px;font-size:0.78rem" data-i18n="settings.weather.attribution">Dati meteo: Open-Meteo.com (CC BY 4.0)</p>
+                    </div>
+                </div>
+            </div>
+            <!-- Health / personal biology Tab -->
+            <div class="settings-panel" id="tab-health">
+                <div class="settings-card">
+                    <h4 data-i18n="settings.health.title">🫀 Dati personali e biologici</h4>
+                    <p class="settings-hint" data-i18n="settings.health.hint">Profilo biologico e sync attività (telefono). Se disattivi la funzione, tutto resta grigio e le ricette «A ritmo mio» non usano i dati salute.</p>
+                    <div class="form-group" style="margin-bottom:14px">
+                        <label class="toggle-row">
+                            <span data-i18n="settings.health.enabled">✅ Abilita dati salute / A ritmo mio</span>
+                            <span class="toggle-switch">
+                                <input type="checkbox" id="setting-health-enabled" onchange="onHealthEnabledChange()">
+                                <span class="toggle-slider"></span>
+                            </span>
+                        </label>
+                    </div>
+                    <div id="health-settings-body" class="health-settings-body">
+                        <div class="form-group" style="margin-bottom:12px">
+                            <label class="checkbox-label"><input type="checkbox" id="setting-pref-fuel"> <span data-i18n="settings.recipe.fuel">🔥 Pref. ricette: A ritmo mio</span></label>
+                            <p class="settings-hint" data-i18n="settings.health.fuel_pref_hint">Se attivo, la generazione ricette propone già il chip Fuel Mode.</p>
+                        </div>
+                        <h5 class="settings-subheading" data-i18n="settings.health.profile_title">Profilo biologico</h5>
+                        <div class="form-group recipe-fuel-manual-grid">
+                            <label class="recipe-fuel-field"><span data-i18n="settings.health.sex">Sesso</span>
+                                <select id="health-profile-sex" class="form-input">
+                                    <option value="">—</option>
+                                    <option value="m" data-i18n="settings.health.sex_m">M</option>
+                                    <option value="f" data-i18n="settings.health.sex_f">F</option>
+                                    <option value="other" data-i18n="settings.health.sex_other">Altro</option>
+                                </select>
+                            </label>
+                            <label class="recipe-fuel-field"><span data-i18n="settings.health.birth_year">Anno di nascita</span><input type="number" id="health-profile-birth-year" class="form-input" min="1920" max="2015" placeholder="es. 1985"></label>
+                            <label class="recipe-fuel-field"><span data-i18n="settings.health.height">Altezza (cm)</span><input type="number" id="health-profile-height" class="form-input" min="100" max="250" step="1"></label>
+                            <label class="recipe-fuel-field"><span data-i18n="settings.health.weight">Peso (kg)</span><input type="number" id="health-profile-weight" class="form-input" min="30" max="300" step="0.1"></label>
+                            <label class="recipe-fuel-field"><span data-i18n="settings.health.goal">Obiettivo</span>
+                                <select id="health-profile-goal" class="form-input">
+                                    <option value="maintain" data-i18n="settings.health.goal_maintain">Mantenimento</option>
+                                    <option value="lose" data-i18n="settings.health.goal_lose">Dimagrimento</option>
+                                    <option value="gain" data-i18n="settings.health.goal_gain">Massa</option>
+                                </select>
+                            </label>
+                            <label class="recipe-fuel-field"><span data-i18n="settings.health.activity">Attività tipica</span>
+                                <select id="health-profile-activity" class="form-input">
+                                    <option value="sedentary" data-i18n="settings.health.act_sedentary">Sedentaria</option>
+                                    <option value="light" data-i18n="settings.health.act_light">Leggera</option>
+                                    <option value="moderate" selected data-i18n="settings.health.act_moderate">Moderata</option>
+                                    <option value="active" data-i18n="settings.health.act_active">Attiva</option>
+                                </select>
+                            </label>
+                        </div>
+                        <button type="button" class="btn btn-secondary full-width" onclick="saveHealthProfileFromSettings()" data-i18n="settings.health.save">Salva profilo salute</button>
+
+                        <h5 class="settings-subheading mt-2" data-i18n="settings.health.bridge_title">Health Bridge (telefono)</h5>
+                        <div id="health-bridge-download" class="health-bridge-download">
+                            <p class="settings-hint" data-i18n="settings.health.download_hint">Installa l’app Android sul telefono (stessa Wi‑Fi). Legge Health Connect / Google Fit e sincronizza le calorie con EverShelf.</p>
+                            <a id="health-bridge-apk-link" href="https://github.com/dadaloop82/EverShelf/releases/download/health-bridge-latest/evershelf-health-bridge.apk" class="btn btn-large btn-accent full-width" style="text-decoration:none;display:block;text-align:center;margin-bottom:10px" data-i18n="settings.health.download_btn">📥 Scarica Health Bridge (APK)</a>
+                        </div>
+                        <div id="health-bridge-box" class="health-bridge-box">
+                            <p class="settings-hint" data-i18n="settings.health.bridge_hint">1) Scarica e installa l’APK sul telefono. 2) Crea il token qui. 3) Nell’app scansiona il QR: passa URL del server + token insieme. Nessuna digitatura.</p>
+                            <div id="health-pairing-url" class="settings-hint" style="font-family:monospace;word-break:break-all"></div>
+                            <div id="health-bridge-qr" class="health-bridge-qr" style="display:none;text-align:center;margin:10px 0"></div>
+                            <button type="button" class="btn btn-accent btn-sm" onclick="createHealthBridgeToken()" data-i18n="settings.health.bridge_create">📷 Genera QR di abbinamento</button>
+                            <button type="button" class="btn btn-ghost btn-sm" onclick="unlinkHealthBridge()" data-i18n="settings.health.bridge_unlink">Scollega / revoca token</button>
+                            <pre id="health-bridge-token-out" class="health-bridge-token-out" hidden style="display:none" aria-hidden="true"></pre>
+                        </div>
+                        <div id="health-today-status" class="health-today-status mt-2"></div>
+                    </div>
+                </div>
+            </div>
+            <!-- Weekly Meal Plan Tab -->
+            <div class="settings-panel" id="tab-mealplan">
+                <div class="settings-card">
+                    <h4 data-i18n="settings.mealplan.title">📅 Piano Pasti Settimanale</h4>
+                    <p class="settings-hint" data-i18n="settings.mealplan.hint">Imposta la tipologia di pasto per ogni giorno. Sarà usata come guida nella generazione delle ricette.</p>
+                    <div class="form-group" style="margin-bottom:10px">
+                        <label class="toggle-row">
+                            <span data-i18n="settings.mealplan.enabled">✅ Attiva piano pasti settimanale</span>
+                            <span class="toggle-switch">
+                                <input type="checkbox" id="setting-meal-plan-enabled" onchange="onMealPlanEnabledChange(this)">
+                                <span class="toggle-slider"></span>
+                            </span>
+                        </label>
+                    </div>
+                    <div id="meal-plan-config-section">
+                        <div id="meal-plan-grid" class="mplan-grid"></div>
+                        <div id="meal-plan-picker" class="mplan-picker" style="display:none"></div>
+                        <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap">
+                            <button class="btn btn-small btn-secondary" onclick="resetMealPlan()" data-i18n="settings.mealplan.reset_btn">↺ Ripristina default</button>
+                        </div>
+                        <div class="settings-hint" style="margin-top:10px" data-i18n-html="settings.mealplan.legend">
+                            🌤️ = Pranzo &nbsp;·&nbsp; 🌙 = Cena &nbsp;·&nbsp; Tocca un badge per cambiarlo.
+                        </div>
+                    </div>
+                </div>
+                <div class="settings-card" id="meal-plan-legend-card">
+                    <h4 data-i18n="settings.mealplan.types_title">📋 Tipologie disponibili</h4>
+                    <div class="mplan-legend"></div>
+                </div>
+            </div>
+            <!-- Appliances Tab -->
+            <div class="settings-panel" id="tab-appliances">
+                <div class="settings-card">
+                    <h4 data-i18n="settings.appliances.title">🔌 Elettrodomestici Disponibili</h4>
+                    <p class="settings-hint" data-i18n="settings.appliances.hint">Indica gli elettrodomestici che hai a disposizione. Saranno considerati nella generazione delle ricette.</p>
+                    <div class="appliances-list" id="appliances-list"></div>
+                    <div class="form-group mt-2">
+                        <div class="barcode-input-row">
+                            <input type="text" id="new-appliance-input" class="form-input" placeholder="Es: Macchina del pane, Bimby, Friggitrice ad aria..." data-i18n-placeholder="settings.appliances.new_placeholder" onkeydown="if(event.key==='Enter'){event.preventDefault();addAppliance()}">
+                            <button class="btn btn-accent" onclick="addAppliance()">➕</button>
+                        </div>
+                    </div>
+                    <div class="common-appliances mt-2">
+                        <p class="settings-hint" data-i18n="settings.appliances.quick_title">Aggiungi velocemente:</p>
+                        <div class="appliance-quick-tags">
+                            <button class="btn btn-small btn-secondary" onclick="addApplianceQuick('settings.appliances.oven')" data-i18n="settings.appliances.oven">🔥 Forno</button>
+                            <button class="btn btn-small btn-secondary" onclick="addApplianceQuick('settings.appliances.microwave')" data-i18n="settings.appliances.microwave">📡 Microonde</button>
+                            <button class="btn btn-small btn-secondary" onclick="addApplianceQuick('settings.appliances.air_fryer')" data-i18n="settings.appliances.air_fryer">🍟 Friggitrice ad aria</button>
+                            <button class="btn btn-small btn-secondary" onclick="addApplianceQuick('settings.appliances.bread_maker')" data-i18n="settings.appliances.bread_maker">🍞 Macchina pane</button>
+                            <button class="btn btn-small btn-secondary" onclick="addApplianceQuick('settings.appliances.bimby')" data-i18n="settings.appliances.bimby">🤖 Bimby/Cookeo</button>
+                            <button class="btn btn-small btn-secondary" onclick="addApplianceQuick('settings.appliances.mixer')" data-i18n="settings.appliances.mixer">🌀 Planetaria</button>
+                            <button class="btn btn-small btn-secondary" onclick="addApplianceQuick('settings.appliances.steamer')" data-i18n="settings.appliances.steamer">♨️ Vaporiera</button>
+                            <button class="btn btn-small btn-secondary" onclick="addApplianceQuick('settings.appliances.pressure_cooker')" data-i18n="settings.appliances.pressure_cooker">🫕 Pentola pressione</button>
+                            <button class="btn btn-small btn-secondary" onclick="addApplianceQuick('settings.appliances.toaster')" data-i18n="settings.appliances.toaster">🍞 Tostapane</button>
+                            <button class="btn btn-small btn-secondary" onclick="addApplianceQuick('settings.appliances.blender')" data-i18n="settings.appliances.blender">🍹 Frullatore</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <!-- Camera Tab -->
+            <div class="settings-panel" id="tab-camera">
+                <div class="settings-card">
+                    <h4 data-i18n="settings.camera.title">📷 Fotocamera</h4>
+                    <p class="settings-hint" data-i18n="settings.camera.hint">Scegli quale fotocamera utilizzare per la scansione barcode e l'identificazione AI.</p>
+                    <div class="form-group">
+                        <label data-i18n="settings.camera.device_label">📸 Fotocamera predefinita</label>
+                        <select id="setting-camera-facing" class="form-input">
+                            <option value="environment" data-i18n="settings.camera.back">📱 Posteriore (default)</option>
+                            <option value="user" data-i18n="settings.camera.front">🤳 Anteriore</option>
+                        </select>
+                        <p class="settings-hint mt-2" data-i18n="settings.camera.devices_hint">Se hai più fotocamere, puoi selezionarne una specifica dall'elenco sopra dopo aver concesso i permessi.</p>
+                        <button class="btn btn-small btn-secondary mt-2" onclick="loadCameraDevices()" data-i18n="settings.camera.detect_btn">🔄 Rileva fotocamere</button>
+                    </div>
+                    <div class="form-group" style="margin-top:14px">
+                        <p class="settings-hint" data-i18n="settings.camera.ai_manual_hint">Se il barcode non si legge, usa il pulsante «Identifica con AI» sotto la fotocamera. Richiede Gemini configurato.</p>
+                    </div>
+                </div>
+            </div>
+            <!-- Security Tab -->
+            <div class="settings-panel" id="tab-security">
+                <div class="settings-card">
+                    <h4 data-i18n="settings.security.token_title">🔑 Token Impostazioni</h4>
+                    <p class="settings-hint" data-i18n="settings.security.token_hint">Se <code>SETTINGS_TOKEN</code> è configurato nel <code>.env</code> server, inserisci qui il token prima di salvare le impostazioni. Lascia vuoto se non configurato.</p>
+                    <div class="form-group">
+                        <label data-i18n="settings.security.token_label">Token di accesso</label>
+                        <input type="password" id="setting-settings-token" class="form-input" placeholder="API_TOKEN da .env" data-i18n-placeholder="settings.security.token_placeholder">
+                        <button class="btn btn-small btn-secondary mt-2" onclick="togglePasswordVisibility('setting-settings-token')" data-i18n="btn.toggle_password">👁️ Mostra/Nascondi</button>
+                    </div>
+                    <p class="settings-hint" id="settings-token-status-hint" style="display:none;color:var(--accent)" data-i18n="settings.security.token_required_hint">🔒 Questo server richiede un token API (API_TOKEN nel file .env). Il token viene salvato nel browser.</p>
+                </div>
+                <div class="settings-card">
+                    <h4 data-i18n="settings.security.title">🔒 Certificato HTTPS</h4>
+                    <p class="settings-hint" data-i18n="settings.security.hint">Se il browser mostra l'errore "La connessione non è privata" (ERR_CERT_AUTHORITY_INVALID), devi installare il certificato CA nel dispositivo.</p>
+                    <div class="form-group">
+                        <a href="ca.crt" download="EverShelf_CA.crt" class="btn btn-large btn-accent full-width" style="text-align:center;text-decoration:none;display:block" data-i18n="settings.security.download_btn">📥 Scarica Certificato CA</a>
+                    </div>
+                    <div class="settings-hint" style="margin-top:12px;line-height:1.6" data-i18n-html="settings.security.cert_instructions">
+                        <strong>Istruzioni per Chrome (Android):</strong><br>
+                        1. Scarica il certificato qui sopra<br>
+                        2. Vai in <em>Impostazioni → Sicurezza e privacy → Altre impostazioni di sicurezza → Installa da archivio dispositivo</em><br>
+                        3. Seleziona il file <em>EverShelf_CA.crt</em> scaricato<br>
+                        4. Scegli "CA" e conferma<br>
+                        5. Riavvia Chrome<br><br>
+                        <strong>Istruzioni per Chrome (PC):</strong><br>
+                        1. Scarica il certificato qui sopra<br>
+                        2. Vai in <em>chrome://settings/certificates</em> (o Impostazioni → Privacy e sicurezza → Sicurezza → Gestisci certificati)<br>
+                        3. Tab "Autorità" → Importa → seleziona il file<br>
+                        4. Spunta "Considera attendibile per identificare siti web"<br>
+                        5. Riavvia Chrome
+                    </div>
+                </div>
+            </div>
+            <!-- TTS Tab -->
+            <div class="settings-panel" id="tab-tts">
+                <div class="settings-card">
+                    <h4 data-i18n="settings.tts.title">🔊 Voce & TTS</h4>
+                    <p class="settings-hint" data-i18n="settings.tts.hint">Configura la sintesi vocale. Puoi usare la voce offline del browser oppure un endpoint REST esterno (Home Assistant, ecc.).</p>
+                    <div class="form-group" style="margin-bottom:10px">
+                        <label class="toggle-row">
+                            <span data-i18n="settings.tts.enabled">✅ Attiva TTS</span>
+                            <span class="toggle-switch">
+                                <input type="checkbox" id="setting-tts-enabled">
+                                <span class="toggle-slider"></span>
+                            </span>
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.tts.engine_label">⚙️ Motore TTS</label>
+                        <select id="setting-tts-engine" class="form-input" onchange="onTtsEngineChange(this.value)">
+                            <option value="browser" data-i18n="settings.tts.engine_browser">🔇 Browser (offline, nessuna configurazione)</option>
+                            <option value="server" data-i18n="settings.tts.engine_server">🌐 Server esterno (Home Assistant, API REST...)</option>
+                        </select>
+                    </div>
+
+                    <!-- Browser TTS section -->
+                    <div id="tts-browser-section">
+                        <div class="form-group">
+                            <label data-i18n="settings.tts.voice_label">🗣️ Voce</label>
+                            <div style="display:flex;gap:8px;align-items:center">
+                                <select id="setting-tts-voice" class="form-input" style="flex:1">
+                                    <option value="" data-i18n="settings.tts.voices_loading">— Caricamento voci… —</option>
+                                </select>
+                                <button type="button" class="btn btn-secondary" style="padding:8px 12px;white-space:nowrap;flex-shrink:0" onclick="_initBrowserTtsVoices(document.getElementById('setting-tts-voice').value)">↺</button>
+                            </div>
+                            <p class="settings-hint" data-i18n="settings.tts.voices_hint">Le voci disponibili dipendono dal sistema operativo e dal browser. Su macOS/iOS è disponibile la voce <strong>Paola</strong> (italiano). Premi ↺ se la lista non si carica.</p>
+                        </div>
+                        <div class="form-group">
+                            <label><span data-i18n="settings.tts.rate_label">⚡ Velocità</span>: <span id="tts-rate-label">1.0</span>×</label>
+                            <input type="range" id="setting-tts-rate" class="form-input" min="0.5" max="2" step="0.1" value="1" oninput="document.getElementById('tts-rate-label').textContent=parseFloat(this.value).toFixed(1)">
+                        </div>
+                        <div class="form-group">
+                            <label><span data-i18n="settings.tts.pitch_label">🎵 Tono</span>: <span id="tts-pitch-label">1.0</span></label>
+                            <input type="range" id="setting-tts-pitch" class="form-input" min="0" max="2" step="0.1" value="1" oninput="document.getElementById('tts-pitch-label').textContent=parseFloat(this.value).toFixed(1)">
+                        </div>
+                    </div>
+
+                    <!-- Server TTS section -->
+                    <div id="tts-server-section" style="display:none">
+                    <div class="form-group">
+                        <label data-i18n="settings.tts.url_label">🌐 URL Endpoint</label>
+                        <input type="url" id="setting-tts-url" class="form-input" placeholder="https://...">
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.tts.method_label">📡 Metodo HTTP</label>
+                        <select id="setting-tts-method" class="form-input">
+                            <option value="POST">POST</option>
+                            <option value="PUT">PUT</option>
+                            <option value="PATCH">PATCH</option>
+                            <option value="GET">GET</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.tts.auth_label">🔐 Autenticazione</label>
+                        <select id="setting-tts-auth-type" class="form-input" onchange="onTtsAuthTypeChange(this.value)">
+                            <option value="bearer" data-i18n="settings.tts.auth_bearer">Bearer Token</option>
+                            <option value="header" data-i18n="settings.tts.auth_custom">Header personalizzato</option>
+                            <option value="none" data-i18n="settings.tts.auth_none">Nessuna</option>
+                        </select>
+                    </div>
+                    <div class="form-group" id="tts-token-group">
+                        <label data-i18n="settings.tts.token_label">🔑 Bearer Token</label>
+                        <input type="password" id="setting-tts-token" class="form-input" placeholder="eyJhbGci...">
+                        <button class="btn btn-small btn-secondary mt-2" onclick="togglePasswordVisibility('setting-tts-token')" data-i18n="btn.toggle_password">👁️ Mostra/Nascondi</button>
+                    </div>
+                    <div id="tts-custom-header-group" style="display:none">
+                        <div class="form-group">
+                            <label data-i18n="settings.tts.custom_header_name">📋 Nome header</label>
+                            <input type="text" id="setting-tts-auth-header-name" class="form-input" placeholder="X-API-Key">
+                        </div>
+                        <div class="form-group">
+                            <label data-i18n="settings.tts.custom_header_value">📋 Valore header</label>
+                            <input type="text" id="setting-tts-auth-header-value" class="form-input" placeholder="...">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.tts.content_type_label">📄 Content-Type</label>
+                        <select id="setting-tts-content-type" class="form-input">
+                            <option value="application/json">application/json</option>
+                            <option value="application/x-www-form-urlencoded">application/x-www-form-urlencoded</option>
+                            <option value="text/plain">text/plain</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.tts.payload_key_label">🗝️ Campo testo nel payload</label>
+                        <input type="text" id="setting-tts-payload-key" class="form-input" placeholder="message">
+                        <p class="settings-hint">Nome del campo JSON che conterrà il testo da leggere (es: <code>message</code>, <code>text</code>).</p>
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.tts.extra_fields_label">➕ Campi extra (JSON)</label>
+                        <textarea id="setting-tts-extra-fields" class="form-input" rows="3" placeholder='{"entity_id": "media_player.living_room"}'></textarea>
+                        <p class="settings-hint" data-i18n="settings.tts.extra_fields_hint">Campi aggiuntivi da includere nel payload, in formato JSON. Lascia vuoto se non necessario.</p>
+                    </div>
+                    </div><!-- /tts-server-section -->
+
+                    <button class="btn btn-large btn-secondary full-width mt-2" onclick="testSound()" data-i18n="settings.tts.test_sound_btn">🔔 Esegui Test Suono</button>
+                    <button class="btn btn-large btn-accent full-width mt-2" onclick="testTTS()" data-i18n="settings.tts.test_btn">🔊 Invia Test Vocale</button>
+                    <div id="tts-test-status" style="display:none;margin-top:8px"></div>
+                    <!-- HA TTS quick-fill hint -->
+                    <div style="margin-top:12px;padding:10px 12px;background:rgba(3,169,244,0.07);border:1px solid rgba(3,169,244,0.25);border-radius:8px;font-size:0.82rem">
+                        <span data-i18n="settings.ha.ha_hint">🏠 Se usi Home Assistant, usa il tab <strong>Home Assistant</strong> per configurare TTS, webhook e sensori.</span>
+                    </div>
+                </div>
+            </div>
+            <!-- Home Assistant Tab -->
+            <div class="settings-panel" id="tab-ha">
+                <!-- Connection card -->
+                <div class="settings-card">
+                    <h4 data-i18n="settings.ha.title">🏠 Home Assistant</h4>
+                    <p class="settings-hint" data-i18n="settings.ha.hint">Integra EverShelf con Home Assistant: TTS su speaker smart, webhook per automazioni, sensori per la dashboard.</p>
+
+                    <div class="form-group" style="margin-bottom:10px">
+                        <label class="toggle-row">
+                            <span data-i18n="settings.ha.enabled">✅ Abilita integrazione Home Assistant</span>
+                            <span class="toggle-switch">
+                                <input type="checkbox" id="setting-ha-enabled" onchange="onHaEnabledChange()">
+                                <span class="toggle-slider"></span>
+                            </span>
+                        </label>
+                    </div>
+
+                    <div id="ha-config-section">
+                        <div class="form-group">
+                            <label data-i18n="settings.ha.url_label">🌐 Home Assistant URL</label>
+                            <input type="url" id="setting-ha-url" class="form-input" placeholder="http://192.168.1.50:8123">
+                            <p class="settings-hint" data-i18n="settings.ha.url_hint">URL base della tua istanza HA (senza slash finale). Es: <code>http://homeassistant.local:8123</code></p>
+                        </div>
+                        <div class="form-group">
+                            <label data-i18n="settings.ha.token_label">🔑 Long-Lived Access Token</label>
+                            <div style="display:flex;gap:8px;align-items:center">
+                                <input type="password" id="setting-ha-token" class="form-input" style="flex:1" placeholder="eyJhbGci...">
+                                <button class="btn btn-secondary" style="flex-shrink:0" onclick="togglePasswordVisibility('setting-ha-token')" data-i18n="btn.toggle_password">👁️</button>
+                            </div>
+                            <p class="settings-hint" data-i18n="settings.ha.token_hint">Genera un token in HA → Profilo → Token di accesso a lungo termine.</p>
+                        </div>
+                        <button class="btn btn-secondary full-width" onclick="testHaConnection()" data-i18n="settings.ha.test_btn">🔗 Testa connessione HA</button>
+                        <div id="ha-test-status" style="display:none;margin-top:8px" class="settings-status"></div>
+                    </div>
+                </div>
+
+                <!-- TTS via HA card -->
+                <div class="settings-card">
+                    <h4 data-i18n="settings.ha.tts_title">🔊 TTS su Speaker Smart</h4>
+                    <p class="settings-hint" data-i18n="settings.ha.tts_hint">Leggi i passi della ricetta su un altoparlante gestito da HA (Sonos, Echo, Google Home, ecc.).</p>
+
+                    <div class="form-group">
+                        <label data-i18n="settings.ha.tts_entity_label">🔈 Entity ID del media player</label>
+                        <input type="text" id="setting-ha-tts-entity" class="form-input" placeholder="media_player.living_room">
+                        <p class="settings-hint" data-i18n="settings.ha.tts_entity_hint">Copia l'entity ID del media player da HA → Strumenti sviluppatore → Stati.</p>
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.ha.tts_platform_label">🎙️ Piattaforma TTS</label>
+                        <select id="setting-ha-tts-platform" class="form-input">
+                            <option value="tts.speak" data-i18n="settings.ha.tts_platform_speak">tts.speak (raccomandato)</option>
+                            <option value="notify" data-i18n="settings.ha.tts_platform_notify">notify.* (servizio notifiche)</option>
+                        </select>
+                    </div>
+                    <button class="btn btn-secondary full-width" onclick="applyHaTtsPreset()" data-i18n="settings.ha.tts_apply_btn">✅ Applica preset HA al TTS</button>
+                    <p class="settings-hint mt-2" data-i18n="settings.ha.tts_apply_hint">Configura automaticamente il tab TTS con i parametri HA corretti.</p>
+                </div>
+
+                <!-- Webhook card -->
+                <div class="settings-card">
+                    <h4 data-i18n="settings.ha.webhook_title">⚡ Automazioni Webhook</h4>
+                    <p class="settings-hint" data-i18n="settings.ha.webhook_hint">EverShelf chiama il webhook HA quando si verificano eventi (prodotto in scadenza, aggiunto alla lista, ecc.).</p>
+
+                    <div class="form-group">
+                        <label data-i18n="settings.ha.webhook_id_label">🔗 Webhook ID</label>
+                        <input type="text" id="setting-ha-webhook-id" class="form-input" placeholder="evershelf_events">
+                        <p class="settings-hint" data-i18n="settings.ha.webhook_id_hint">Crea un'automazione in HA con trigger "Webhook" e copia qui l'ID. <a href="#" onclick="showHaWebhookHelp();return false" style="color:var(--accent)">Come farlo?</a></p>
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.ha.webhook_events_label">📋 Eventi da notificare</label>
+                        <div style="display:flex;flex-direction:column;gap:6px;margin-top:4px">
+                            <label style="display:flex;align-items:center;gap:8px;font-weight:normal">
+                                <input type="checkbox" id="ha-event-expiry" value="expiry"> <span data-i18n="settings.ha.event_expiry">Prodotti in scadenza (cron giornaliero)</span>
+                            </label>
+                            <label style="display:flex;align-items:center;gap:8px;font-weight:normal">
+                                <input type="checkbox" id="ha-event-shopping" value="shopping_add"> <span data-i18n="settings.ha.event_shopping">Aggiunta alla lista della spesa</span>
+                            </label>
+                            <label style="display:flex;align-items:center;gap:8px;font-weight:normal">
+                                <input type="checkbox" id="ha-event-stock" value="stock_update"> <span data-i18n="settings.ha.event_stock">Aggiornamento scorte (quantità modificata)</span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label data-i18n="settings.ha.expiry_days_label">📅 Giorni anticipo per scadenze</label>
+                        <input type="number" id="setting-ha-expiry-days" class="form-input" min="1" max="30" value="3">
+                        <p class="settings-hint" data-i18n="settings.ha.expiry_days_hint">Quanti giorni prima della scadenza inviare l'alert.</p>
+                    </div>
+                </div>
+
+                <!-- Notify service card -->
+                <div class="settings-card">
+                    <h4 data-i18n="settings.ha.notify_title">📱 Notifiche Push</h4>
+                    <p class="settings-hint" data-i18n="settings.ha.notify_hint">EverShelf invia notifiche push tramite il servizio <code>notify.*</code> di HA (Telegram, Pushover, app mobile, ecc.).</p>
+
+                    <div class="form-group">
+                        <label data-i18n="settings.ha.notify_service_label">📣 Servizio notify</label>
+                        <input type="text" id="setting-ha-notify-service" class="form-input" placeholder="notify.mobile_app_mio_telefono">
+                        <p class="settings-hint" data-i18n="settings.ha.notify_service_hint">Formato: <code>notify.NOME_SERVIZIO</code>. Lascia vuoto per disabilitare. Richiede token HA configurato.</p>
+                    </div>
+                </div>
+
+                <!-- Sensor card (read-only info) -->
+                <div class="settings-card">
+                    <h4 data-i18n="settings.ha.sensor_title">📊 Sensori REST per HA</h4>
+                    <p class="settings-hint" data-i18n="settings.ha.sensor_hint">HA può leggere i dati dell'inventario via REST polling. Aggiungi questo snippet a <code>configuration.yaml</code>:</p>
+                    <div id="ha-sensor-yaml" style="background:var(--bg-secondary,#f1f5f9);border-radius:8px;padding:12px;font-family:monospace;font-size:0.75rem;white-space:pre;overflow-x:auto;max-height:220px;overflow-y:auto;border:1px solid var(--border,#e2e8f0)"></div>
+                    <button class="btn btn-secondary full-width mt-2" onclick="copyHaSensorYaml()" data-i18n="settings.ha.sensor_copy_btn">📋 Copia YAML</button>
+                </div>
+
+                <!-- Save button -->
+                <button class="btn btn-large btn-accent full-width" onclick="saveHaSettings()" data-i18n="settings.ha.save_btn">💾 Salva impostazioni HA</button>
+                <div id="ha-save-status" style="display:none;margin-top:8px" class="settings-status"></div>
+            </div>
+            <!-- Scale Tab -->
+            <div class="settings-panel" id="tab-scale">
+                <div class="settings-card">
+                    <h4 data-i18n="settings.scale.title">⚖️ Bilancia Smart</h4>
+                    <p class="settings-hint" data-i18n="settings.scale.hint">Collega una bilancia Bluetooth tramite il gateway Android per leggere il peso automaticamente.</p>
+
+                    <!-- Kiosk-mode panel: replace WebSocket config with native reconfigure button -->
+                    <div id="scale-kiosk-panel" style="display:none;background:rgba(16,185,129,0.07);border:1px solid rgba(16,185,129,0.25);border-radius:10px;padding:14px;margin-bottom:16px">
+                        <p style="margin:0 0 6px;font-weight:600" data-i18n="settings.scale.kiosk_title">📡 Bilancia BLE integrata nel Kiosk</p>
+                        <p class="settings-hint" style="margin-bottom:12px" data-i18n="settings.scale.kiosk_hint">La bilancia è gestita direttamente dal Gateway BLE interno al kiosk. Per abbinare un nuovo dispositivo usa il wizard di configurazione.</p>
+                        <button class="btn btn-secondary full-width" onclick="_kioskReconfigureScale()" data-i18n="settings.scale.kiosk_reconfigure">🔄 Riconfigura bilancia BLE</button>
+                        <!-- shown when kiosk APK is too old to have reconfigureScale() -->
+                        <div id="kiosk-needs-update-notice" style="display:none;margin-top:10px;padding:8px 12px;background:rgba(245,158,11,0.1);border:1px solid rgba(245,158,11,0.35);border-radius:8px;font-size:0.83rem">
+                            <span data-i18n="settings.kiosk.needs_update">⚠️ Il kiosk installato non supporta questa funzione.
+                            Aggiorna l'app kiosk per abilitarla.</span>
+                            <a href="https://github.com/dadaloop82/EverShelf/releases/download/kiosk-latest/evershelf-kiosk.apk" target="_blank" rel="noopener noreferrer" style="display:block;margin-top:6px;color:#d97706;font-weight:600;text-decoration:none" data-i18n="settings.kiosk.download_btn">📥 Scarica aggiornamento kiosk</a>
+                        </div>
+                    </div>
+
+                    <!-- Download gateway app -->
+                    <div id="scale-gateway-download-section" style="background:rgba(124,58,237,0.07);border:1px solid rgba(124,58,237,0.2);border-radius:10px;padding:14px;margin-bottom:16px">
+                        <p style="margin:0 0 4px;font-weight:600">📱 EverShelf Scale Gateway</p>
+                        <p class="settings-hint" style="margin-bottom:10px" data-i18n="settings.scale.download_hint">App Android che fa da ponte tra la bilancia BLE e questo sito.</p>
+                        <a href="https://github.com/dadaloop82/EverShelf/releases/latest/download/evershelf-scale-gateway.apk" target="_blank" rel="noopener noreferrer" class="btn btn-large btn-accent full-width" style="text-decoration:none;display:block;text-align:center" data-i18n="settings.scale.download_btn">📥 Scarica Gateway Android (APK)</a>
+                        <p class="settings-hint" style="margin-top:8px" data-i18n="settings.scale.download_sub">Sorgente: <code>evershelf-scale-gateway/</code> nella root del progetto</p>
+                    </div>
+
+                    <!-- Enable toggle -->
+                    <div class="form-group" style="margin-bottom:10px">
+                        <label class="toggle-row">
+                            <span data-i18n="settings.scale.enabled">✅ Abilita bilancia smart</span>
+                            <span class="toggle-switch">
+                                <input type="checkbox" id="setting-scale-enabled" onchange="onScaleEnabledChange()">
+                                <span class="toggle-slider"></span>
+                            </span>
+                        </label>
+                    </div>
+
+                    <!-- Gateway URL -->
+                    <div id="scale-websocket-section" class="form-group">
+                        <label data-i18n="settings.scale.url_label">🌐 URL Gateway WebSocket</label>
+                        <div style="display:flex;gap:8px;align-items:center">
+                            <input type="url" id="setting-scale-url" class="form-input" style="flex:1" placeholder="ws://192.168.1.x:8765" data-i18n-placeholder="settings.scale.url_placeholder">
+                            <button class="btn btn-secondary" style="white-space:nowrap;flex-shrink:0" onclick="discoverScaleGateway()" id="btn-scale-discover" title="Scan local network">🔍 Auto</button>
+                        </div>
+                        <div id="scale-discover-status" style="display:none;margin-top:6px;font-size:0.82rem;color:var(--text-secondary)"></div>
+                        <p class="settings-hint" data-i18n="settings.scale.url_hint">Copia l'URL mostrato dall'app Android (stessa rete Wi-Fi). Es: <code>ws://192.168.1.100:8765</code></p>
+                    </div>
+
+                    <!-- Test button -->
+                    <div id="scale-test-section">
+                        <button class="btn btn-secondary full-width mt-2" onclick="testScaleConnection()" data-i18n="settings.scale.test_btn">🔗 Testa connessione</button>
+                        <div id="scale-test-status" style="display:none;margin-top:8px" class="settings-status"></div>
+                    </div>
+
+                    <!-- Live diagnostic: device info + real-time weight (visible when connected) -->
+                    <div id="scale-live-diag" style="display:none;margin-top:14px;padding:12px 14px;background:var(--bg-secondary,#f8fafc);border-radius:10px;border:1px solid var(--border,#e2e8f0)">
+                        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">
+                            <span style="font-size:0.8rem;color:var(--text-secondary)">🔗 <span id="scale-diag-device">—</span></span>
+                            <span id="scale-diag-battery" style="font-size:0.8rem;color:var(--text-secondary)"></span>
+                        </div>
+                        <div style="text-align:center">
+                            <div id="scale-diag-weight" style="font-size:2rem;font-weight:700;line-height:1;letter-spacing:1px">— g</div>
+                            <div style="font-size:0.72rem;color:var(--text-secondary);margin-top:3px" data-i18n="settings.scale.live_weight">peso in tempo reale</div>
+                        </div>
+                        <div style="margin-top:10px;display:flex;gap:8px;font-size:0.78rem;color:var(--text-secondary)">
+                            <span data-i18n="settings.scale.auto_reconnect">🔁 Riconnessione: automatica</span>
+                            <span style="margin-left:auto" id="scale-diag-proto">—</span>
+                        </div>
+                    </div>
+
+                    <!-- Protocol info -->
+                    <div class="settings-hint" style="margin-top:16px;padding:10px;background:var(--bg-secondary,#f8fafc);border-radius:8px" data-i18n-html="settings.scale.ble_protocols">
+                        <p style="margin:0 0 6px;font-weight:600">🔌 Protocolli BLE supportati:</p>
+                        <ul style="margin:0 0 0 16px;padding:0;font-size:0.8rem">
+                            <li>Bluetooth SIG Weight Scale (0x181D)</li>
+                            <li>Bluetooth SIG Body Composition (0x181B) — peso, grasso, BMI</li>
+                            <li>Xiaomi Mi Body Composition Scale 2</li>
+                            <li>Generico — heuristica automatica su 100+ modelli</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+            <!-- Language Tab -->
+
+            <!-- Backup Tab -->
+            <div class="settings-panel" id="tab-backup">
+                <!-- Local Backup -->
+                <div class="settings-card">
+                    <h4 data-i18n="settings.backup.local_title">💾 Backup Locale</h4>
+                    <p class="settings-hint" data-i18n="settings.backup.local_hint">Snapshot giornaliero automatico del database. Massimo 3 giorni di storico (configurabile).</p>
+                    <div id="backup-last-info" style="margin-bottom:12px;padding:10px 12px;background:var(--bg-secondary,#f8fafc);border-radius:8px;font-size:0.83rem;color:var(--text-secondary)">
+                        <span data-i18n="settings.info.loading">Caricamento…</span>
+                    </div>
+                    <div class="form-group" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px">
+                        <label data-i18n="settings.backup.retention_days" style="flex-shrink:0">Retention (giorni):</label>
+                        <input type="number" id="setting-backup-retention-days" class="form-input" style="width:80px" min="1" max="90" value="3">
+                    </div>
+                    <button class="btn btn-large btn-accent full-width" onclick="_backupNow()" id="btn-backup-now" data-i18n="settings.backup.backup_now">💾 Backup Ora</button>
+                    <div id="backup-status" style="display:none;margin-top:8px" class="settings-status"></div>
+                    <!-- List of backups -->
+                    <div id="backup-list-container" style="margin-top:14px">
+                        <p class="settings-hint" data-i18n="settings.info.loading">Caricamento…</p>
+                    </div>
+                </div>
+                <!-- Google Drive -->
+                <div class="settings-card">
+                    <h4 data-i18n="settings.backup.gdrive_title">☁️ Google Drive</h4>
+                    <p class="settings-hint" data-i18n="settings.backup.gdrive_hint">Carica automaticamente il backup su Google Drive usando un Service Account.</p>
+                    <div class="form-group" style="margin-bottom:10px">
+                        <label class="toggle-row">
+                            <span data-i18n="settings.backup.gdrive_enabled">Abilita backup Google Drive</span>
+                            <span class="toggle-switch">
+                                <input type="checkbox" id="setting-gdrive-enabled" onchange="saveSettings()">
+                                <span class="toggle-slider"></span>
+                            </span>
+                        </label>
+                    </div>
+                    <div id="gdrive-config-section">
+                        <!-- Folder ID (shared between both methods) -->
+                        <div class="form-group">
+                            <label data-i18n="settings.backup.gdrive_folder_id">ID Cartella Drive</label>
+                            <input type="text" id="setting-gdrive-folder-id" class="form-input" placeholder="1ABCdef_xyz…">
+                            <p class="settings-hint" data-i18n="settings.backup.gdrive_folder_id_hint">Copia l'ID dalla URL della cartella Drive: …/folders/<strong>ID</strong></p>
+                        </div>
+                        <!-- OAuth 2.0 section -->
+                        <div id="gdrive-oauth-section">
+                            <details style="margin-bottom:14px;background:var(--bg-secondary,#f8fafc);border-radius:8px;padding:10px 14px">
+                                <summary style="cursor:pointer;font-weight:600;font-size:0.83rem" data-i18n="settings.backup.gdrive_oauth_how_to">📋 Come configurare OAuth 2.0 (passo dopo passo)</summary>
+                                <ol style="margin:10px 0 0 16px;font-size:0.8rem;color:var(--text-secondary);line-height:1.8" data-i18n-html="settings.backup.gdrive_oauth_steps"></ol>
+                            </details>
+                            <div class="form-group">
+                                <label data-i18n="settings.backup.gdrive_client_id">Client ID</label>
+                                <input type="text" id="setting-gdrive-client-id" class="form-input" placeholder="1234567890-abc….apps.googleusercontent.com">
+                            </div>
+                            <div class="form-group">
+                                <label data-i18n="settings.backup.gdrive_client_secret">Client Secret</label>
+                                <input type="password" id="setting-gdrive-client-secret" class="form-input" placeholder="GOCSPX-…">
+                            </div>
+                            <div class="form-group" style="background:var(--bg-secondary,#f8fafc);border-radius:8px;padding:10px 14px;font-size:0.82rem">
+                                <span data-i18n="settings.backup.gdrive_redirect_uri_label">Redirect URI (aggiungi in Google Cloud Console):</span>
+                                <code id="gdrive-redirect-uri-display" style="display:block;margin-top:4px;word-break:break-all;color:var(--text-primary);font-size:0.78rem">http://localhost</code>
+                                <p class="settings-hint" style="margin-top:6px;margin-bottom:0" data-i18n="settings.backup.gdrive_redirect_uri_hint">Registra questo URI in Google Cloud Console come "URI di reindirizzamento autorizzato". Per le installazioni senza dominio pubblico usa <strong>http://localhost</strong>.</p>
+                            </div>
+                            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px">
+                                <button class="btn btn-secondary" onclick="_gdriveAuthorize()" id="btn-gdrive-authorize" data-i18n="settings.backup.gdrive_oauth_authorize">🔑 Autorizza con Google</button>
+                                <span id="gdrive-oauth-token-status" style="font-size:0.83rem"></span>
+                            </div>
+                            <!-- Manual code entry (appears after clicking Authorize) -->
+                            <div id="gdrive-code-section" style="display:none;margin-top:12px;padding:12px 14px;background:var(--bg-secondary,#f8fafc);border-radius:8px;border:1px solid var(--border)">
+                                <p style="font-size:0.82rem;margin-bottom:8px;font-weight:600" data-i18n="settings.backup.gdrive_code_title">Incolla l'URL o il codice di autorizzazione</p>
+                                <p class="settings-hint" style="margin-bottom:8px" data-i18n="settings.backup.gdrive_code_hint">Dopo aver autorizzato su Google, il browser proverà ad aprire <code>http://localhost</code> e mostrerà un errore. Copia l'intero URL dalla barra degli indirizzi e incollalo qui sotto.</p>
+                                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                                    <input type="text" id="gdrive-code-input" class="form-input" style="flex:1;min-width:0" placeholder="http://localhost/?code=4%2F0A… oppure solo il codice">
+                                    <button class="btn btn-primary" onclick="_gdriveSubmitCode()" id="btn-gdrive-submit-code" data-i18n="settings.backup.gdrive_code_submit">Conferma</button>
+                                </div>
+                            </div>
+                        </div>
+                        <!-- Retention + action buttons (shared) -->
+                        <div class="form-group" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">
+                            <label data-i18n="settings.backup.gdrive_retention_days" style="flex-shrink:0">Retention Drive (giorni, 0=tutto):</label>
+                            <input type="number" id="setting-gdrive-retention-days" class="form-input" style="width:80px" min="0" max="365" value="30">
+                        </div>
+                        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+                            <button class="btn btn-secondary" onclick="_gdriveTest()" id="btn-gdrive-test" data-i18n="settings.backup.gdrive_test">🔗 Testa Connessione</button>
+                            <button class="btn btn-accent" onclick="_gdrivePushNow()" id="btn-gdrive-push" data-i18n="settings.backup.gdrive_push_now">☁️ Carica Ora su Drive</button>
+                        </div>
+                        <div id="gdrive-test-status" style="display:none;margin-top:8px" class="settings-status"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Info Tab -->
+            <div class="settings-panel" id="tab-info">
+                <!-- Gemini AI Usage card -->
+                <div class="settings-card">
+                    <h4 data-i18n="settings.info.ai_title">Gemini AI — Token Usage</h4>
+                    <p class="settings-hint info-ai-subtitle" data-i18n="settings.info.ai_overview">Utilizzo AI, inventario e sistema</p>
+                    <div id="info-ai-content" style="margin-top:10px">
+                        <p class="settings-hint" data-i18n="settings.info.loading">Caricamento…</p>
+                    </div>
+                </div>
+                <!-- Inventory card -->
+                <div class="settings-card">
+                    <h4 data-i18n="settings.info.inv_title">Inventario</h4>
+                    <div id="info-inv-content" style="margin-top:10px">
+                        <p class="settings-hint" data-i18n="settings.info.loading">Caricamento…</p>
+                    </div>
+                </div>
+                <!-- Activity card -->
+                <div class="settings-card">
+                    <h4 data-i18n="settings.info.act_title">Attività del mese</h4>
+                    <div id="info-act-content" style="margin-top:10px">
+                        <p class="settings-hint" data-i18n="settings.info.loading">Caricamento…</p>
+                    </div>
+                </div>
+                <!-- System Info card -->
+                <div class="settings-card">
+                    <h4 data-i18n="settings.info.system_title">Sistema</h4>
+                    <div id="info-system-content" style="margin-top:10px">
+                        <p class="settings-hint" data-i18n="settings.info.loading">Caricamento…</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Kiosk app download banner (hidden inside kiosk WebView) -->
+        <div id="kiosk-download-banner" style="background:linear-gradient(135deg,rgba(16,185,129,0.08),rgba(5,150,105,0.12));border:1.5px solid rgba(16,185,129,0.25);border-radius:12px;padding:16px;margin-top:16px">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+                <span style="font-size:1.6rem">📺</span>
+                <div>
+                    <p style="margin:0;font-weight:700;font-size:0.95rem;color:#065f46">EverShelf Kiosk</p>
+                    <p class="settings-hint" style="margin:2px 0 0" data-i18n="settings.kiosk.hint">Trasforma un tablet Android in un pannello EverShelf sempre acceso, con bilancia BLE integrata.</p>
+                </div>
+            </div>
+            <a href="https://github.com/dadaloop82/EverShelf/releases/download/kiosk-latest/evershelf-kiosk.apk" target="_blank" rel="noopener noreferrer" class="btn btn-large btn-accent full-width" style="text-decoration:none;display:block;text-align:center;background:linear-gradient(135deg,#059669,#10b981);color:#fff" data-i18n="settings.kiosk.download_btn">📥 Scarica EverShelf Kiosk (APK)</a>
+            <p class="settings-hint" style="margin-top:8px" data-i18n="settings.kiosk.download_sub">Modalità kiosk full-screen + gateway bilancia integrato. Sorgente: <code>evershelf-kiosk/</code></p>
+        </div>
+
+        <!-- Kiosk native settings panel (visible only inside kiosk WebView) -->
+        <div id="kiosk-native-settings-panel" style="display:none;background:rgba(99,102,241,0.06);border:1.5px solid rgba(99,102,241,0.2);border-radius:12px;padding:16px;margin-top:16px">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+                <span style="font-size:1.4rem">🖥️</span>
+                <div>
+                    <p style="margin:0;font-weight:700;font-size:0.9rem" data-i18n="settings.kiosk.native_title">Configurazione Kiosk</p>
+                    <p class="settings-hint" style="margin:2px 0 0" data-i18n="settings.kiosk.native_hint">URL server, bilancia BLE, salvaschermo e setup wizard.</p>
+                </div>
+            </div>
+            <button class="btn btn-secondary full-width" onclick="_openKioskNativeSettings()">⚙️ <span data-i18n="settings.kiosk.native_btn">Apri configurazione kiosk</span></button>
+        </div>
+
+        <!-- Kiosk self-update panel (visible only inside kiosk WebView) -->
+        <div id="kiosk-update-panel" style="display:none;background:rgba(16,185,129,0.06);border:1.5px solid rgba(16,185,129,0.2);border-radius:12px;padding:16px;margin-top:16px">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px">
+                <div style="display:flex;align-items:center;gap:8px">
+                    <span style="font-size:1.4rem">📦</span>
+                    <div>
+                        <p style="margin:0;font-weight:700;font-size:0.9rem" data-i18n="settings.kiosk.update_title">Aggiornamento Kiosk</p>
+                        <p class="settings-hint" style="margin:2px 0 0" id="kiosk-update-version-label">—</p>
+                    </div>
+                </div>
+                <button class="btn btn-secondary" style="white-space:nowrap;min-width:120px" id="btn-kiosk-check-update" onclick="_kioskCheckForUpdates()" data-i18n="settings.kiosk.check_updates_btn">🔍 Cerca aggiornamenti</button>
+            </div>
+            <div id="kiosk-update-status" style="display:none;padding:10px 12px;border-radius:8px;font-size:0.85rem;line-height:1.4"></div>
+            <button id="btn-kiosk-install-update" style="display:none;width:100%;margin-top:10px" class="btn btn-accent btn-large" onclick="_kioskInstallUpdate()">⬇️ Installa aggiornamento</button>
+        </div>
+
+        <button class="btn btn-large btn-success full-width mt-2" onclick="saveSettings()" data-i18n="btn.save_config">💾 Salva Configurazione</button>
+        <div id="settings-status" class="settings-status" style="display:none"></div>
+
+        <!-- About & Support -->
+        <div class="settings-section" style="margin-top:24px">
+            <h3 class="settings-section-title" data-i18n="about.title">About</h3>
+            <div class="settings-row" style="justify-content:space-between;align-items:center">
+                <span class="settings-label" data-i18n="about.version">Version</span>
+                <span id="about-version-label" class="settings-hint" style="font-family:monospace">—</span>
+            </div>
+            <div style="margin-top:10px;display:flex;flex-direction:column;gap:8px">
+                <button class="btn btn-outline full-width" onclick="reportBugManual()" id="btn-report-bug">
+                    🐛 <span data-i18n="about.report_bug">Segnala un problema</span>
+                </button>
+                <p class="settings-hint" style="text-align:center;margin:0" data-i18n="about.report_bug_hint">Qualcosa non funziona? Inviaci una segnalazione direttamente dall'app.</p>
+                <div style="display:flex;gap:8px">
+                    <a class="btn btn-outline full-width" style="text-decoration:none;text-align:center"
+                       href="https://github.com/dadaloop82/EverShelf/blob/main/CHANGELOG.md"
+                       target="_blank" rel="noopener" data-i18n="about.changelog">Changelog</a>
+                    <a class="btn btn-outline full-width" style="text-decoration:none;text-align:center"
+                       href="https://github.com/dadaloop82/EverShelf"
+                       target="_blank" rel="noopener" data-i18n="about.github">GitHub</a>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ===== GEMINI CHAT ===== -->
+    <section class="page" id="page-chat">
+        <div class="chat-container">
+            <div class="chat-header-bar">
+                <div class="chat-header-info">
+                    <svg class="gemini-icon-sm" viewBox="0 0 24 24" width="22" height="22" fill="#6366f1"><path d="M12 0C12 6.627 6.627 12 0 12c6.627 0 12 5.373 12 12 0-6.627 5.373-12 12-12-6.627 0-12-5.373-12-12z"/></svg>
+                    <span class="chat-title" data-i18n="chat.title">Gemini Chef</span>
+                </div>
+                <button class="btn-chat-clear" onclick="clearChat()" title="Nuova conversazione" data-i18n-title="chat.clear">🗑️</button>
+            </div>
+            <div class="chat-messages" id="chat-messages">
+                <div class="chat-welcome">
+                    <svg class="gemini-icon-lg" viewBox="0 0 24 24" width="48" height="48" fill="#6366f1"><path d="M12 0C12 6.627 6.627 12 0 12c6.627 0 12 5.373 12 12 0-6.627 5.373-12 12-12-6.627 0-12-5.373-12-12z"/></svg>
+                    <h3 data-i18n="chat.welcome">Ciao! Sono il tuo assistente cucina</h3>
+                    <p data-i18n="chat.welcome_desc">Chiedimi di prepararti un succo, uno spuntino, un piatto veloce... Conosco la tua dispensa, i tuoi elettrodomestici e le tue preferenze!</p>
+                    <div class="chat-suggestions">
+                        <button class="chat-suggestion" onclick="sendChatSuggestion('Cosa posso preparare per uno spuntino veloce?')" data-i18n="chat.suggestion_snack">🍿 Spuntino veloce</button>
+                        <button class="chat-suggestion" onclick="sendChatSuggestion('Fammi un succo o frullato con quello che ho')" data-i18n="chat.suggestion_juice">🥤 Succo/Frullato</button>
+                        <button class="chat-suggestion" onclick="sendChatSuggestion('Ho fame ma voglio qualcosa di leggero')" data-i18n="chat.suggestion_light">🥗 Qualcosa di leggero</button>
+                        <button class="chat-suggestion" onclick="sendChatSuggestion('Cosa sta per scadere e come posso usarlo?')" data-i18n="chat.suggestion_expiry">⏰ Usa le scadenze</button>
+                    </div>
+                </div>
+            </div>
+            <div class="chat-input-bar">
+                <input type="text" id="chat-input" class="chat-input" placeholder="Chiedi qualcosa..." onkeydown="if(event.key==='Enter')sendChatMessage()" data-i18n-placeholder="chat.placeholder">
+                <button class="btn-chat-send" id="btn-chat-send" onclick="sendChatMessage()">
+                    <svg viewBox="0 0 24 24" width="22" height="22" fill="white"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+                </button>
+            </div>
+        </div>
+    </section>
+
+</main>
+
+<!-- Bottom Navigation -->
+<nav class="bottom-nav">
+    <button class="nav-btn" onclick="showPage('dashboard')" data-page="dashboard">
+        <span class="nav-icon"><img src="assets/img/logo/logo_icon.png" alt="" class="nav-logo-icon" /></span>
+        <span class="nav-label" data-i18n="nav.home">Home</span>
+    </button>
+    <button class="nav-btn" onclick="showPage('inventory', '')" data-page="inventory">
+        <span class="nav-icon">📋</span>
+        <span class="nav-label" data-i18n="nav.inventory">Dispensa</span>
+    </button>
+    <button class="nav-btn" onclick="showPage('recipe')" data-page="recipe">
+        <span class="nav-icon">🍳</span>
+        <span class="nav-label" data-i18n="nav.recipes">Ricette</span>
+    </button>
+    <button class="nav-btn nav-gemini-btn" id="nav-gemini-btn" onclick="_openGeminiChat()" data-page="chat"
+            title="Gemini Chef" data-i18n-title="chat.title">
+        <span class="nav-gemini-icon-wrap" aria-hidden="true">
+            <svg class="nav-gemini-icon" viewBox="0 0 24 24" width="26" height="26" fill="white"><path d="M12 0C12 6.627 6.627 12 0 12c6.627 0 12 5.373 12 12 0-6.627 5.373 12 12-12-6.627 0-12-5.373-12-12z"/></svg>
+        </span>
+        <span class="nav-label" data-i18n="nav.gemini">Gemini</span>
+    </button>
+    <button class="nav-btn" onclick="showPage('shopping')" data-page="shopping">
+        <span class="nav-icon">🛒</span>
+        <span class="nav-label" data-i18n="nav.shopping">Spesa</span>
+    </button>
+    <button class="nav-btn" onclick="showPage('log')" data-page="log">
+        <span class="nav-icon">📋</span>
+        <span class="nav-label" data-i18n="nav.log">Storico</span>
+    </button>
+    <button class="nav-btn" onclick="showPage('settings')" data-page="settings">
+        <span class="nav-icon">⚙️</span>
+        <span class="nav-label" data-i18n="nav.settings">Config</span>
+    </button>
+</nav>
+
+<!-- Recipe Dialog -->
+<div class="modal-overlay" id="recipe-overlay" style="display:none" onclick="closeRecipeDialog()">
+    <div class="modal-content recipe-dialog" onclick="event.stopPropagation()">
+        <div id="recipe-mealplan-banner" class="recipe-mealplan-banner" style="display:none"></div>
+        <div id="recipe-ask" class="recipe-ask">
+            <h3 id="recipe-meal-title" data-i18n="recipes.dialog_title">🍳 Ricetta</h3>
+            <p class="recipe-desc" data-i18n="recipes.dialog_desc">Genero una ricetta sana con gli ingredienti in dispensa, dando priorità a quelli in scadenza.</p>
+            <div class="form-group" style="text-align:left">
+                <label data-i18n="recipes.meal_label">🕐 Per quale pasto?</label>
+                <div class="recipe-meal-grid" id="recipe-meal-grid" onchange="updateRecipeMealTitle()"></div>
+                <div class="recipe-meal-grid recipe-subtype-grid" id="recipe-subtype-group" style="display:none"></div>
+            </div>
+            <div id="recipe-mealplan-hint" class="recipe-mealplan-hint" style="display:none"></div>
+            <div class="form-group">
+                <label data-i18n="recipes.persons_label">👥 Quante persone?</label>
+                <div class="qty-control">
+                    <button type="button" class="qty-btn" onclick="adjustRecipePersons(-1)">−</button>
+                    <input type="number" id="recipe-persons" value="1" min="1" max="20" class="qty-input">
+                    <button type="button" class="qty-btn" onclick="adjustRecipePersons(1)">+</button>
+                </div>
+            </div>
+            <div class="form-group" style="text-align:left">
+                <label data-i18n="recipes.meal_type_label">🎯 Tipo di pasto</label>
+                <div class="recipe-options-grid">
+                    <label class="recipe-option-chip recipe-opt-mealplan-chip" id="recipe-opt-mealplan-wrap" style="display:none"><input type="checkbox" id="recipe-opt-mealplan" checked onchange="onMealPlanChipChange(this)"> <span id="recipe-opt-mealplan-label"></span></label>
+                    <label class="recipe-option-chip"><input type="checkbox" id="recipe-opt-veloce"> <span data-i18n="recipes.opt_fast">⚡ Pasto Veloce</span></label>
+                    <label class="recipe-option-chip"><input type="checkbox" id="recipe-opt-pocafame"> <span data-i18n="recipes.opt_light">🥗 Poca Fame</span></label>
+                    <label class="recipe-option-chip"><input type="checkbox" id="recipe-opt-scadenze"> <span data-i18n="recipes.opt_expiry">⏰ Priorità Scadenze</span></label>
+                    <label class="recipe-option-chip"><input type="checkbox" id="recipe-opt-healthy"> <span data-i18n="recipes.opt_healthy">💚 Extra Salutare</span></label>
+                    <label class="recipe-option-chip"><input type="checkbox" id="recipe-opt-opened"> <span data-i18n="recipes.opt_opened">📦 Priorità Cose Aperte</span></label>
+                    <label class="recipe-option-chip"><input type="checkbox" id="recipe-opt-zerowaste"> <span data-i18n="recipes.opt_zero_waste">♻️ Zero Sprechi</span></label>
+                    <label class="recipe-option-chip recipe-opt-fuel-wrap recipe-opt-fuel-featured" id="recipe-opt-fuel-wrap"><input type="checkbox" id="recipe-opt-fuel" onchange="onRecipeFuelToggle()"> <span data-i18n="recipes.opt_fuel">🔥 A ritmo mio</span></label>
+                </div>
+            </div>
+            <button class="btn btn-large btn-success full-width" onclick="generateRecipe()" data-i18n="recipes.generate_btn">
+                ✨ Genera Ricetta
+            </button>
+            <button class="btn btn-large btn-secondary full-width mt-2" onclick="closeRecipeDialog()" data-i18n="btn.cancel">
+                Annulla
+            </button>
+        </div>
+        <div id="recipe-loading" style="display:none" class="recipe-loading">
+            <div class="loading-spinner"></div>
+            <p id="recipe-loading-msg" data-i18n="recipes.loading_msg">Sto preparando la ricetta...</p>
+        </div>
+        <div id="recipe-result" style="display:none" class="recipe-result">
+            <div id="recipe-content"></div>
+            <button id="recipe-regen-btn" class="btn btn-large btn-secondary full-width mt-2" onclick="showRegenChoice()" data-i18n="recipes.regenerate">
+                🔄 Generane un'altra
+            </button>
+            <div id="recipe-regen-choice" style="display:none" class="recipe-regen-choice">
+                <p class="recipe-regen-choice-title" data-i18n="recipes.regen_choice_title">Cosa vuoi fare con questa ricetta?</p>
+                <button class="btn btn-large btn-warning full-width" onclick="doRegenerateReplace()" data-i18n="recipes.regen_replace">🔄 Genera un'altra (scarta questa)</button>
+                <button class="btn btn-large btn-success full-width mt-2" onclick="doRegenerateSave()" data-i18n="recipes.regen_save_new">💾 Salva nell'archivio e genera nuova</button>
+                <button class="btn btn-large btn-ghost full-width mt-2" onclick="cancelRegenChoice()" data-i18n="confirm.cancel">Annulla</button>
+            </div>
+            <button class="btn btn-large btn-primary full-width mt-2" onclick="closeRecipeDialog()" data-i18n="recipes.close_btn">
+                ✅ Chiudi
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Setup Wizard (first-run) -->
+<div class="modal-overlay" id="setup-wizard" style="display:none">
+    <div class="modal-content setup-wizard-content" onclick="event.stopPropagation()">
+        <div class="setup-header">
+            <h2><img src="assets/img/logo/logo_icon.png" alt="" class="header-logo-icon" style="height:28px;vertical-align:middle;margin-right:6px" /> EverShelf</h2>
+            <div class="setup-progress" id="setup-progress"></div>
+        </div>
+        <div class="setup-body" id="setup-body"></div>
+        <div class="setup-footer">
+            <button class="btn btn-secondary" id="setup-prev" onclick="setupWizardNav(-1)" style="display:none" data-i18n="btn.back">← Indietro</button>
+            <button class="btn btn-accent" id="setup-next" onclick="setupWizardNav(1)" data-i18n="btn.next">Avanti →</button>
+        </div>
+    </div>
+</div>
+
+<!-- Toast notification -->
+<div class="toast" id="toast"></div>
+
+<!-- Loading Overlay -->
+<div class="loading-overlay" id="loading" style="display:none">
+    <div class="loading-spinner"></div>
+    <p data-i18n="app.loading">Caricamento...</p>
+</div>
+
+<!-- Modal for product details from inventory -->
+<div class="modal-overlay" id="modal-overlay" style="display:none" onclick="closeModal()">
+    <div class="modal-content" id="modal-content" onclick="event.stopPropagation()"></div>
+</div>
+
+<!-- Screensaver Overlay -->
+<div id="screensaver" class="screensaver-overlay" style="display:none">
+    <div class="screensaver-content">
+        <div class="screensaver-clock" id="screensaver-clock"></div>
+        <div id="screensaver-shopping" class="screensaver-shopping" style="display:none"></div>
+        <div id="screensaver-mealplan" class="screensaver-mealplan" style="display:none"></div>
+        <!-- Nutrition pie charts panel (shown alternately with fact) -->
+        <div id="screensaver-nutrition" class="screensaver-nutrition" style="display:none"></div>
+        <div class="screensaver-fact" id="screensaver-fact"></div>
+    </div>
+    <div class="screensaver-shortcuts">
+        <button class="screensaver-shortcut-btn" id="screensaver-recipe-btn" data-i18n-title="screensaver.recipe_btn" title="Recipes">
+            🍳
+        </button>
+        <button class="screensaver-shortcut-btn" id="screensaver-scan-btn" data-i18n-title="screensaver.scan_long_hint" title="Scan product">
+            📷
+        </button>
+    </div>
+</div>
+
+<!-- ===== NETWORK ERROR OVERLAY ===== -->
+<div id="network-error-overlay" style="display:none" aria-live="assertive" role="alert">
+    <div class="net-error-body">
+        <div class="net-error-icon" id="net-error-icon">📡</div>
+        <div class="net-error-title" id="net-error-title" data-i18n="error.offline_title">Nessuna connessione</div>
+        <div class="net-error-subtitle" id="net-error-subtitle" data-i18n="error.offline_subtitle">L'app non riesce a raggiungere il server. Verifica la connessione Wi-Fi.</div>
+        <div class="net-error-status" id="net-error-status"></div>
+        <button class="net-error-continue-btn" id="net-error-continue-btn" onclick="_enterOfflineMode()" data-i18n="error.offline_continue" style="display:none">Continua in modalità offline</button>
+    </div>
+</div>
+
+<!-- ===== COOKING MODE OVERLAY ===== -->
+<div id="cooking-overlay" class="cooking-overlay" style="display:none" aria-live="polite">
+    <div id="cooking-flash-overlay" class="cooking-flash-overlay"></div>
+    <div class="cooking-header">
+        <button class="cooking-close-btn" onclick="closeCookingMode()" data-i18n-title="cooking.close" title="Close">✕</button>
+        <span class="cooking-title" id="cooking-title"></span>
+        <button class="cooking-tts-btn" id="cooking-tts-btn" onclick="toggleCookingTTS()" data-i18n-title="cooking.tts_btn" title="Read aloud">🔊</button>
+    </div>
+    <div id="cooking-timers-bar" class="cooking-timers-bar" style="display:none"></div>
+    <div id="cooking-tools-bar" class="cooking-tools-bar" style="display:none"></div>
+    <div class="cooking-body">
+        <div class="cooking-step-header">
+            <div class="cooking-step-num" id="cooking-step-num">1 / 1</div>
+            <button class="cooking-restart-btn" onclick="restartCookingMode()" data-i18n-title="cooking.restart_title" data-i18n="cooking.restart">↺ Restart</button>
+        </div>
+        <div class="cooking-progress-dots" id="cooking-progress-dots"></div>
+        <div class="cooking-wheel" id="cooking-wheel" tabindex="0" data-i18n-aria="cooking.wheel_aria" aria-label="Recipe step navigation">
+            <div class="cooking-step-ghost cooking-step-prev" id="cooking-step-prev"></div>
+            <div class="cooking-step-text" id="cooking-step-text"></div>
+            <div class="cooking-step-ghost cooking-step-next" id="cooking-step-next"></div>
+        </div>
+        <button class="cooking-replay-btn" id="cooking-replay" onclick="replayCookingTTS()" data-i18n-title="cooking.replay_title" data-i18n="cooking.replay">🔊 Replay</button>
+        <div class="cooking-timer-suggest" id="cooking-timer-suggest" style="display:none">
+            <button class="cooking-timer-add-btn" onclick="addSuggestedCookingTimer()">
+                <span id="cooking-timer-suggest-text">⏱️ 00:00 · Timer</span>
+            </button>
+        </div>
+        <div class="cooking-step-ings" id="cooking-step-ings" style="display:none"></div>
+        <div id="cooking-zerowaste-tip" class="cooking-zerowaste-tip" style="display:none">
+            <span class="cooking-zerowaste-label" data-i18n="cooking.zerowaste_label">♻️ Scarto</span>
+            <span id="cooking-zerowaste-scrap" class="cooking-zerowaste-scrap"></span>
+            <p id="cooking-zerowaste-text" class="cooking-zerowaste-text"></p>
+            <button class="cooking-zerowaste-close" onclick="_dismissZeroWasteTip()" data-i18n-aria="cooking.close" aria-label="Close">✕</button>
+        </div>
+    </div>
+    <div class="cooking-nav">
+        <button class="cooking-nav-btn cooking-prev-btn" id="cooking-prev" onclick="navigateCookingStep(-1)">◀ Precedente</button>
+        <button class="cooking-nav-btn cooking-next-btn" id="cooking-next" onclick="navigateCookingStep(1)">Successivo ▶</button>
+    </div>
+</div>
+
+<script src="assets/js/app.js?v=20260918a"></script>
+</body>
+</html>

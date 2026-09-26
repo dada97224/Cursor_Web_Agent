@@ -2,23 +2,11 @@
 
 import io
 
-import pytest
-from fastapi.testclient import TestClient
 from PIL import Image
 
 from maison.ocr import extraire_lignes
 from maison.repas import idees
 from maison.texte import mot_dans, score_noms
-
-
-@pytest.fixture
-def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("MAISON_DB", str(tmp_path / "maison.sqlite"))
-    monkeypatch.setenv("MAISON_UPLOADS", str(tmp_path / "uploads"))
-    from maison.main import creer_application
-
-    with TestClient(creer_application()) as test:
-        yield test
 
 
 def test_ticket_ignore_le_total():
@@ -106,8 +94,8 @@ def test_conversation(client):
     client.post("/api/messages", json={"texte": "range le lait dans le frigo", "auteur": "Camille"})
     retrouve = client.post("/api/messages", json={"texte": "où est le lait"})
     assert "Frigo" in retrouve.json()["reponse"]
-    client.post("/api/produits", json={"nom": "Œufs", "categorie": "cuisine", "quantite": 6, "etat": "y_en_a"})
-    client.post("/api/produits", json={"nom": "Pâtes", "categorie": "cuisine", "quantite": 2, "etat": "y_en_a"})
+    client.post("/api/messages", json={"texte": "range les oeufs dans le frigo"})
+    client.post("/api/messages", json={"texte": "range les pates dans le placard"})
     repas = client.post("/api/messages", json={"texte": "qu'est-ce qu'on mange"})
     assert "1." in repas.json()["reponse"]
     manque = client.post("/api/messages", json={"texte": "plus de pain"})
@@ -119,18 +107,20 @@ def test_liste_avec_precision(client):
     reponse = client.post("/api/messages", json={"texte": phrase}).json()["reponse"]
     assert "6, 12 ou 24" in reponse
     assert "2 litres" in reponse
-    noms = [ligne["nom"] for ligne in client.get("/api/courses").json()]
-    assert "Lait" in noms
-    assert "Pain de Mie" in noms
-    assert "Coca" in noms
-    assert "Œufs" not in noms
+    lignes = client.get("/api/etageres/courses").json()
+    noms = " ".join(f"{ligne['nom']} {ligne['nom_dit']}" for ligne in lignes).lower()
+    assert "lait" in noms
+    assert "pain" in noms
+    assert "coca" in noms
+    assert "œuf" not in noms and "oeuf" not in noms
     suite = client.post("/api/messages", json={"texte": "12"}).json()["reponse"]
     assert "12" in suite
-    oeufs = next(ligne for ligne in client.get("/api/courses").json() if ligne["nom"] == "Œufs")
-    assert oeufs["quantite"] == 12
+    lignes = client.get("/api/etageres/courses").json()
+    oeufs = next(ligne for ligne in lignes if "oeuf" in f"{ligne['nom']} {ligne['nom_dit']}".lower() or "œuf" in f"{ligne['nom']} {ligne['nom_dit']}".lower())
+    assert oeufs["specification"].startswith("12")
     stock = client.post("/api/messages", json={"texte": "j'ai rangé la liste des courses, tu peux actualiser le stock"}).json()
     assert "Stock actualisé" in stock["reponse"]
-    assert client.get("/api/courses").json() == []
+    assert client.get("/api/etageres/courses").json() == []
 
 
 def test_parole_transcrite(client, monkeypatch):
@@ -141,9 +131,11 @@ def test_parole_transcrite(client, monkeypatch):
     )
     assert reponse.status_code == 200
     assert reponse.json()["transcription"].startswith("il faudrait")
-    noms = [ligne["nom"] for ligne in client.get("/api/courses").json()]
-    assert "Lait" in noms
-    assert "Pain" in noms
+    noms = " ".join(
+        f"{ligne['nom']} {ligne['nom_dit']}" for ligne in client.get("/api/etageres/courses").json()
+    ).lower()
+    assert "lait" in noms
+    assert "pain" in noms
 
 
 def test_menus_et_plante(client):

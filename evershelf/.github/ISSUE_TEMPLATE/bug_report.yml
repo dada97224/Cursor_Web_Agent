@@ -1,0 +1,114 @@
+name: Bug Report
+description: Report a bug or unexpected behavior in EverShelf
+title: "[BUG] "
+labels: ["bug"]
+assignees: ["dadaloop82"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill in the details below.
+        Before submitting, check the [FAQ](https://github.com/dadaloop82/EverShelf/wiki/FAQ) and [existing issues](https://github.com/dadaloop82/EverShelf/issues?q=is%3Aissue+label%3Abug).
+
+  - type: input
+    id: version
+    attributes:
+      label: EverShelf Version
+      description: Found in Settings → About, or in the footer of the web app.
+      placeholder: "e.g. 1.7.13"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of EverShelf is affected?
+      options:
+        - Web app (browser / PWA)
+        - Android Kiosk app
+        - API / PHP backend
+        - Docker setup
+        - Bring! integration
+        - AI features (Gemini)
+        - Smart Scale
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of the bug.
+      placeholder: "What went wrong?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this?
+      placeholder: |
+        1. Go to '...'
+        2. Tap '...'
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What should have happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened? Include error messages, screenshots, or console output.
+    validations:
+      required: true
+
+  - type: input
+    id: browser
+    attributes:
+      label: Browser / OS
+      placeholder: "e.g. Chrome 124 on Android 13, Safari on iOS 17, Firefox on Ubuntu 22.04"
+
+  - type: input
+    id: php
+    attributes:
+      label: PHP Version (if relevant)
+      placeholder: "e.g. 8.2.12 — run: php -v"
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installation Method
+      options:
+        - Docker (docker compose)
+        - Manual (Apache/Nginx)
+        - Other
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs
+      description: PHP error log, browser console output, or `data/error_reports.log` snippet.
+      render: text
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and this is not a duplicate
+          required: true
+        - label: I checked the FAQ
+          required: true
+        - label: I am on the latest version (or this bug exists on the latest version)
+          required: false

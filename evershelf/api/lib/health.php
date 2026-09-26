@@ -1,0 +1,1099 @@
+<?php
+/**
+ * EverShelf Health / Fuel Mode — daily activity snapshots + meal budget for recipes.
+ * Optional: phone Health Bridge can POST via X-Health-Token; UI can save manually.
+ */
+
+/** Ensure health_* tables exist (called from migrateDB). */
+function healthEnsureTables(PDO $db): void {
+    $db->exec("CREATE TABLE IF NOT EXISTS health_daily (
+        date TEXT PRIMARY KEY,
+        source TEXT NOT NULL DEFAULT 'manual',
+        burned_kcal REAL,
+        active_kcal REAL,
+        steps INTEGER,
+        exercise_min INTEGER,
+        exercise_types TEXT,
+        sleep_hours REAL,
+        hydration_ml INTEGER,
+        resting_hr REAL,
+        weight_kg REAL,
+        distance_m INTEGER,
+        floors INTEGER,
+        raw_json TEXT,
+        synced_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )");
+    try {
+        $cols = $db->query("PRAGMA table_info(health_daily)")->fetchAll(PDO::FETCH_ASSOC);
+        $names = array_column($cols, 'name');
+        if (!in_array('distance_m', $names, true)) {
+            $db->exec('ALTER TABLE health_daily ADD COLUMN distance_m INTEGER');
+        }
+        if (!in_array('floors', $names, true)) {
+            $db->exec('ALTER TABLE health_daily ADD COLUMN floors INTEGER');
+        }
+    } catch (Throwable $e) { /* ignore */ }
+
+    $db->exec("CREATE TABLE IF NOT EXISTS health_profile (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        sex TEXT,
+        birth_year INTEGER,
+        height_cm REAL,
+        weight_kg REAL,
+        activity_default TEXT DEFAULT 'moderate',
+        goal TEXT DEFAULT 'maintain',
+        daily_kcal_override INTEGER,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL
+    )");
+
+    $db->exec("CREATE TABLE IF NOT EXISTS health_tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        token_hash TEXT NOT NULL UNIQUE,
+        label TEXT NOT NULL DEFAULT 'Health Bridge',
+        created_at TEXT NOT NULL,
+        last_used_at TEXT,
+        revoked_at TEXT
+    )");
+
+    $db->exec("CREATE TABLE IF NOT EXISTS health_meals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL,
+        meal TEXT NOT NULL DEFAULT 'pranzo',
+        title TEXT NOT NULL DEFAULT '',
+        kcal REAL,
+        protein_g REAL,
+        carbs_g REAL,
+        fat_g REAL,
+        servings REAL NOT NULL DEFAULT 1,
+        source TEXT NOT NULL DEFAULT 'recipe',
+        created_at TEXT NOT NULL
+    )");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_health_meals_date ON health_meals(date)");
+    try {
+        $cols = $db->query("PRAGMA table_info(health_meals)")->fetchAll(PDO::FETCH_ASSOC);
+        $names = array_column($cols, 'name');
+        if (!in_array('source', $names, true)) {
+            $db->exec("ALTER TABLE health_meals ADD COLUMN source TEXT NOT NULL DEFAULT 'recipe'");
+        }
+    } catch (Throwable $e) { /* ignore */ }
+}
+
+function healthTodayDate(): string {
+    try {
+        $tz = env('APP_TIMEZONE', '');
+        if ($tz !== '') {
+            $dt = new DateTime('now', new DateTimeZone($tz));
+            return $dt->format('Y-m-d');
+        }
+    } catch (Throwable $e) {
+        // fall through
+    }
+    return date('Y-m-d');
+}
+
+function healthGetProfile(PDO $db): array {
+    healthEnsureTables($db);
+    $row = $db->query('SELECT * FROM health_profile WHERE id = 1')->fetch(PDO::FETCH_ASSOC);
+    if (!$row) {
+        return [
+            'sex' => null,
+            'birth_year' => null,
+            'height_cm' => null,
+            'weight_kg' => null,
+            'activity_default' => 'moderate',
+            'goal' => 'maintain',
+            'daily_kcal_override' => null,
+            'enabled' => 1,
+        ];
+    }
+    return [
+        'sex' => $row['sex'] ?: null,
+        'birth_year' => $row['birth_year'] !== null ? (int)$row['birth_year'] : null,
+        'height_cm' => $row['height_cm'] !== null ? (float)$row['height_cm'] : null,
+        'weight_kg' => $row['weight_kg'] !== null ? (float)$row['weight_kg'] : null,
+        'activity_default' => $row['activity_default'] ?: 'moderate',
+        'goal' => $row['goal'] ?: 'maintain',
+        'daily_kcal_override' => $row['daily_kcal_override'] !== null ? (int)$row['daily_kcal_override'] : null,
+        'enabled' => (int)($row['enabled'] ?? 1),
+    ];
+}
+
+function healthSaveProfile(PDO $db, array $input): array {
+    healthEnsureTables($db);
+    $cur = healthGetProfile($db);
+    $sex = array_key_exists('sex', $input) ? ($input['sex'] !== null && $input['sex'] !== '' ? (string)$input['sex'] : null) : $cur['sex'];
+    if ($sex !== null && !in_array($sex, ['m', 'f', 'other'], true)) {
+        $sex = $cur['sex'];
+    }
+    $goal = array_key_exists('goal', $input) ? (string)$input['goal'] : $cur['goal'];
+    if (!in_array($goal, ['maintain', 'lose', 'gain'], true)) {
+        $goal = 'maintain';
+    }
+    $activity = array_key_exists('activity_default', $input) ? (string)$input['activity_default'] : $cur['activity_default'];
+    if (!in_array($activity, ['sedentary', 'light', 'moderate', 'active'], true)) {
+        $activity = 'moderate';
+    }
+    $birthYear = array_key_exists('birth_year', $input)
+        ? ($input['birth_year'] !== null && $input['birth_year'] !== '' ? (int)$input['birth_year'] : null)
+        : $cur['birth_year'];
+    if ($birthYear !== null && ($birthYear < 1920 || $birthYear > (int)date('Y') - 10)) {
+        $birthYear = $cur['birth_year'];
+    }
+    $height = array_key_exists('height_cm', $input)
+        ? ($input['height_cm'] !== null && $input['height_cm'] !== '' ? (float)$input['height_cm'] : null)
+        : $cur['height_cm'];
+    $weight = array_key_exists('weight_kg', $input)
+        ? ($input['weight_kg'] !== null && $input['weight_kg'] !== '' ? (float)$input['weight_kg'] : null)
+        : $cur['weight_kg'];
+    $override = array_key_exists('daily_kcal_override', $input)
+        ? ($input['daily_kcal_override'] !== null && $input['daily_kcal_override'] !== '' ? (int)$input['daily_kcal_override'] : null)
+        : $cur['daily_kcal_override'];
+    $enabled = array_key_exists('enabled', $input) ? ((int)!empty($input['enabled'])) : $cur['enabled'];
+    $now = date('c');
+    $db->prepare('INSERT INTO health_profile
+        (id, sex, birth_year, height_cm, weight_kg, activity_default, goal, daily_kcal_override, enabled, updated_at)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            sex=excluded.sex, birth_year=excluded.birth_year, height_cm=excluded.height_cm,
+            weight_kg=excluded.weight_kg, activity_default=excluded.activity_default, goal=excluded.goal,
+            daily_kcal_override=excluded.daily_kcal_override, enabled=excluded.enabled, updated_at=excluded.updated_at
+    ')->execute([$sex, $birthYear, $height, $weight, $activity, $goal, $override, $enabled, $now]);
+    return healthGetProfile($db);
+}
+
+function healthNormalizeDailyPayload(array $input, string $defaultSource = 'manual'): array {
+    $date = trim((string)($input['date'] ?? ''));
+    if ($date === '' || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+        $date = healthTodayDate();
+    }
+    $source = trim((string)($input['source'] ?? $defaultSource));
+    if ($source === '') {
+        $source = $defaultSource;
+    }
+    $allowedSources = ['manual', 'health_connect', 'google_fit', 'bridge', 'demo'];
+    if (!in_array($source, $allowedSources, true)) {
+        $source = $defaultSource;
+    }
+    $numOrNull = static function ($v): ?float {
+        if ($v === null || $v === '') {
+            return null;
+        }
+        return is_numeric($v) ? (float)$v : null;
+    };
+    $kcalOrNull = static function ($v): ?int {
+        if ($v === null || $v === '') {
+            return null;
+        }
+        return is_numeric($v) ? (int)round((float)$v) : null;
+    };
+    $intOrNull = static function ($v): ?int {
+        if ($v === null || $v === '') {
+            return null;
+        }
+        return is_numeric($v) ? (int)$v : null;
+    };
+    $sleepOrNull = static function ($v): ?float {
+        if ($v === null || $v === '') {
+            return null;
+        }
+        return is_numeric($v) ? round((float)$v, 1) : null;
+    };
+    $types = $input['exercise_types'] ?? null;
+    if (is_string($types) && $types !== '') {
+        $decoded = json_decode($types, true);
+        $types = is_array($decoded) ? $decoded : array_values(array_filter(array_map('trim', explode(',', $types))));
+    }
+    if (!is_array($types)) {
+        $types = null;
+    } else {
+        $types = array_values(array_filter(array_map(static fn($t) => is_string($t) ? trim($t) : (string)$t, $types)));
+    }
+    return [
+        'date' => $date,
+        'source' => $source,
+        'burned_kcal' => $kcalOrNull($input['burned_kcal'] ?? null),
+        'active_kcal' => $kcalOrNull($input['active_kcal'] ?? null),
+        'steps' => $intOrNull($input['steps'] ?? null),
+        'exercise_min' => $intOrNull($input['exercise_min'] ?? null),
+        'exercise_types' => $types,
+        'sleep_hours' => $sleepOrNull($input['sleep_hours'] ?? null),
+        'hydration_ml' => $intOrNull($input['hydration_ml'] ?? null),
+        'resting_hr' => $kcalOrNull($input['resting_hr'] ?? null),
+        'weight_kg' => $numOrNull($input['weight_kg'] ?? null) !== null
+            ? round((float)$numOrNull($input['weight_kg']), 1) : null,
+        'distance_m' => $intOrNull($input['distance_m'] ?? null),
+        'floors' => $intOrNull($input['floors'] ?? null),
+        'synced_at' => trim((string)($input['synced_at'] ?? '')) ?: date('c'),
+    ];
+}
+
+function healthUpsertDaily(PDO $db, array $payload, ?array $raw = null): array {
+    healthEnsureTables($db);
+    $now = date('c');
+    $typesJson = isset($payload['exercise_types']) ? json_encode(array_values($payload['exercise_types']), JSON_UNESCAPED_UNICODE) : null;
+    $rawJson = $raw !== null ? json_encode($raw, JSON_UNESCAPED_UNICODE) : null;
+    // Merge: keep previous non-null fields when new payload omits them
+    $prev = healthGetDaily($db, $payload['date']);
+    $merge = static function ($new, $old) {
+        return $new !== null ? $new : $old;
+    };
+    $row = [
+        'date' => $payload['date'],
+        'source' => $payload['source'] ?: ($prev['source'] ?? 'manual'),
+        'burned_kcal' => $merge($payload['burned_kcal'], $prev['burned_kcal'] ?? null),
+        'active_kcal' => $merge($payload['active_kcal'], $prev['active_kcal'] ?? null),
+        'steps' => $merge($payload['steps'], $prev['steps'] ?? null),
+        'exercise_min' => $merge($payload['exercise_min'], $prev['exercise_min'] ?? null),
+        'exercise_types' => $payload['exercise_types'] ?? ($prev['exercise_types'] ?? null),
+        'sleep_hours' => $merge($payload['sleep_hours'], $prev['sleep_hours'] ?? null),
+        'hydration_ml' => $merge($payload['hydration_ml'], $prev['hydration_ml'] ?? null),
+        'resting_hr' => $merge($payload['resting_hr'], $prev['resting_hr'] ?? null),
+        'weight_kg' => $merge($payload['weight_kg'], $prev['weight_kg'] ?? null),
+        'distance_m' => $merge($payload['distance_m'] ?? null, $prev['distance_m'] ?? null),
+        'floors' => $merge($payload['floors'] ?? null, $prev['floors'] ?? null),
+        'synced_at' => $payload['synced_at'],
+        'updated_at' => $now,
+    ];
+    if ($typesJson === null && !empty($row['exercise_types']) && is_array($row['exercise_types'])) {
+        $typesJson = json_encode(array_values($row['exercise_types']), JSON_UNESCAPED_UNICODE);
+    } elseif ($typesJson === null && is_string($row['exercise_types'] ?? null)) {
+        $typesJson = $row['exercise_types'];
+    }
+    $db->prepare('INSERT INTO health_daily
+        (date, source, burned_kcal, active_kcal, steps, exercise_min, exercise_types,
+         sleep_hours, hydration_ml, resting_hr, weight_kg, distance_m, floors, raw_json, synced_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(date) DO UPDATE SET
+            source=excluded.source,
+            burned_kcal=excluded.burned_kcal,
+            active_kcal=excluded.active_kcal,
+            steps=excluded.steps,
+            exercise_min=excluded.exercise_min,
+            exercise_types=excluded.exercise_types,
+            sleep_hours=excluded.sleep_hours,
+            hydration_ml=excluded.hydration_ml,
+            resting_hr=excluded.resting_hr,
+            weight_kg=excluded.weight_kg,
+            distance_m=excluded.distance_m,
+            floors=excluded.floors,
+            raw_json=COALESCE(excluded.raw_json, health_daily.raw_json),
+            synced_at=excluded.synced_at,
+            updated_at=excluded.updated_at
+    ')->execute([
+        $row['date'], $row['source'], $row['burned_kcal'], $row['active_kcal'], $row['steps'],
+        $row['exercise_min'], $typesJson, $row['sleep_hours'], $row['hydration_ml'],
+        $row['resting_hr'], $row['weight_kg'], $row['distance_m'], $row['floors'], $rawJson,
+        $row['synced_at'], $row['updated_at'],
+    ]);
+    // Optionally update profile weight from daily
+    if ($row['weight_kg'] !== null) {
+        $db->prepare('INSERT INTO health_profile (id, weight_kg, updated_at) VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET weight_kg=excluded.weight_kg, updated_at=excluded.updated_at
+        ')->execute([$row['weight_kg'], $now]);
+    }
+    return healthGetDaily($db, $row['date']) ?? $row;
+}
+
+function healthGetDaily(PDO $db, ?string $date = null): ?array {
+    healthEnsureTables($db);
+    $date = $date ?: healthTodayDate();
+    $stmt = $db->prepare('SELECT * FROM health_daily WHERE date = ?');
+    $stmt->execute([$date]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$row) {
+        return null;
+    }
+    if (!empty($row['exercise_types']) && is_string($row['exercise_types'])) {
+        $decoded = json_decode($row['exercise_types'], true);
+        $row['exercise_types'] = is_array($decoded) ? $decoded : [];
+    } else {
+        $row['exercise_types'] = [];
+    }
+    foreach (['burned_kcal', 'active_kcal'] as $f) {
+        if ($row[$f] !== null) {
+            $row[$f] = (int)round((float)$row[$f]);
+        }
+    }
+    if ($row['sleep_hours'] !== null) {
+        $row['sleep_hours'] = round((float)$row['sleep_hours'], 1);
+    }
+    if ($row['resting_hr'] !== null) {
+        $row['resting_hr'] = (int)round((float)$row['resting_hr']);
+    }
+    if ($row['weight_kg'] !== null) {
+        $row['weight_kg'] = round((float)$row['weight_kg'], 1);
+    }
+    foreach (['steps', 'exercise_min', 'hydration_ml', 'distance_m', 'floors'] as $f) {
+        if (array_key_exists($f, $row) && $row[$f] !== null) {
+            $row[$f] = (int)$row[$f];
+        }
+    }
+    unset($row['raw_json']);
+    return $row;
+}
+
+/** Mifflin–St Jeor BMR; falls back to 1650 if profile incomplete. */
+function healthEstimateBmr(array $profile): int {
+    $w = $profile['weight_kg'] ?? null;
+    $h = $profile['height_cm'] ?? null;
+    $by = $profile['birth_year'] ?? null;
+    $sex = $profile['sex'] ?? null;
+    if (!$w || !$h || !$by) {
+        return 1650;
+    }
+    $age = max(15, (int)date('Y') - (int)$by);
+    $bmr = (10 * (float)$w) + (6.25 * (float)$h) - (5 * $age);
+    if ($sex === 'm') {
+        $bmr += 5;
+    } elseif ($sex === 'f') {
+        $bmr -= 161;
+    } else {
+        $bmr -= 78; // midpoint
+    }
+    return (int)max(1200, round($bmr));
+}
+
+function healthEstimateTdee(array $profile, ?array $daily): int {
+    if (!empty($profile['daily_kcal_override']) && (int)$profile['daily_kcal_override'] > 0) {
+        return (int)$profile['daily_kcal_override'];
+    }
+    $bmr = healthEstimateBmr($profile);
+    $mult = [
+        'sedentary' => 1.2,
+        'light' => 1.375,
+        'moderate' => 1.55,
+        'active' => 1.725,
+    ];
+    $base = (int)round($bmr * ($mult[$profile['activity_default'] ?? 'moderate'] ?? 1.55));
+    $burned = $daily['burned_kcal'] ?? null;
+    $active = $daily['active_kcal'] ?? null;
+    // Wearables: "burned" may mean total daily expenditure OR active-only.
+    // If burned is clearly below BMR, treat it as active kcal.
+    if ($burned !== null && $burned > 0) {
+        if ((float)$burned >= $bmr * 0.85) {
+            return (int)round(($base * 0.35) + ((float)$burned * 0.65));
+        }
+        return (int)round($bmr + (float)$burned);
+    }
+    if ($active !== null && $active > 0) {
+        return (int)round($bmr + $active);
+    }
+    return $base;
+}
+
+/**
+ * Meal types already “covered” today (have at least one logged meal with kcal).
+ * Pantry "use" / altro does not mark a main meal as done.
+ *
+ * @param list<array> $meals
+ * @return list<string>
+ */
+function healthMealsCoveredTypes(array $meals): array {
+    $covered = [];
+    foreach ($meals as $m) {
+        $type = strtolower(trim((string)($m['meal'] ?? '')));
+        if ($type === '' || $type === 'altro') {
+            continue;
+        }
+        if ((float)($m['kcal'] ?? 0) <= 0) {
+            continue;
+        }
+        $covered[$type] = true;
+    }
+    return array_keys($covered);
+}
+
+/**
+ * Compute a deterministic meal budget for Fuel Mode.
+ * Subtracts what was already eaten/cooked today (health_meals) so the next
+ * recipe does not overload daily kcal/protein.
+ *
+ * @return array{available:bool,reason?:string,intent:string,label:string,target_kcal:int,protein_g:int,carbs:string,fat:string,notes:string[],daily:?array,tdee:int,meal_share:float,eaten_today?:array,remaining_kcal?:int,target_kcal_raw?:int}
+ */
+function computeMealBudget(PDO $db, string $meal = 'pranzo', array $options = [], string $lang = 'en'): array {
+    healthEnsureTables($db);
+    $profile = healthGetProfile($db);
+    $daily = healthGetDaily($db, healthTodayDate());
+    $mealsToday = healthGetMealsForDate($db, healthTodayDate());
+    $eaten = healthMealsTotals($mealsToday);
+    $coveredTypes = healthMealsCoveredTypes($mealsToday);
+
+    $shares = [
+        'colazione' => 0.25,
+        'pranzo' => 0.35,
+        'cena' => 0.35,
+        'dolce' => 0.12,
+        'succo' => 0.08,
+    ];
+    $share = $shares[$meal] ?? 0.33;
+
+    $tdee = healthEstimateTdee($profile, $daily);
+    $goal = $profile['goal'] ?? 'maintain';
+    if ($goal === 'lose') {
+        $tdee = (int)round($tdee * 0.9);
+    } elseif ($goal === 'gain') {
+        $tdee = (int)round($tdee * 1.08);
+    }
+
+    $steps = (int)($daily['steps'] ?? 0);
+    $exMin = (int)($daily['exercise_min'] ?? 0);
+    $active = (float)($daily['active_kcal'] ?? 0);
+    $sleep = $daily['sleep_hours'] ?? null;
+    $burned = $daily['burned_kcal'] ?? null;
+
+    $intent = 'equilibrio';
+    $label = 'Equilibrio';
+    $notes = [];
+
+    $highActivity = $exMin >= 30 || $active >= 350 || $steps >= 10000
+        || (int)($daily['distance_m'] ?? 0) >= 7000
+        || (int)($daily['floors'] ?? 0) >= 10;
+    $lowActivity = $exMin < 15 && $steps > 0 && $steps < 4000 && $active < 150
+        && (int)($daily['distance_m'] ?? 0) < 3000;
+    $noData = $daily === null
+        || ($burned === null && $active <= 0 && $steps <= 0 && $exMin <= 0);
+
+    $healthLabels = [
+        'it' => ['equilibrio_limited' => 'Equilibrio (dati limitati)', 'no_health_data' => 'Nessun dato salute fresco: budget stimato dal profilo. Inserisci kcal/passi o collega Health Bridge.', 'ricarica' => 'Ricarica post-attività', 'high_activity' => 'Attività elevata oggi → pasto più energetico e ricco di proteine.', 'leggero' => 'Giorno leggero', 'low_activity' => 'Poca attività → densità calorica moderata, più volume da verdure.'],
+        'en' => ['equilibrio_limited' => 'Balance (limited data)', 'no_health_data' => 'No fresh health data: budget estimated from profile. Enter kcal/steps or connect Health Bridge.', 'ricarica' => 'Post-activity recharge', 'high_activity' => 'High activity today → more energetic and protein-rich meal.', 'leggero' => 'Light day', 'low_activity' => 'Low activity → moderate caloric density, more volume from vegetables.'],
+        'de' => ['equilibrio_limited' => 'Gleichgewicht (begrenzte Daten)', 'no_health_data' => 'Keine frischen Gesundheitsdaten: Budget aus Profil geschätzt. Gib kcal/Schritte ein oder verbinde Health Bridge.', 'ricarica' => 'Erholung nach Aktivität', 'high_activity' => 'Hohe Aktivität heute → energiereichere und proteinreichere Mahlzeit.', 'leggero' => 'Leichter Tag', 'low_activity' => 'Wenig Aktivität → moderate Kaloriendichte, mehr Gemüsevolumen.'],
+        'fr' => ['equilibrio_limited' => 'Équilibre (données limitées)', 'no_health_data' => 'Pas de données santé récentes : budget estimé du profil. Entrez kcal/pas ou connectez Health Bridge.', 'ricarica' => 'Recharge post-activité', 'high_activity' => 'Activité élevée aujourd\'hui → repas plus énergétique et riche en protéines.', 'leggero' => 'Journée légère', 'low_activity' => 'Peu d\'activité → densité calorique modérée, plus de volume en légumes.'],
+        'es' => ['equilibrio_limited' => 'Equilibrio (datos limitados)', 'no_health_data' => 'Sin datos de salud recientes: presupuesto estimado del perfil. Ingresa kcal/pasos o conecta Health Bridge.', 'ricarica' => 'Recarga post-actividad', 'high_activity' => 'Actividad elevada hoy → comida más energética y rica en proteínas.', 'leggero' => 'Día ligero', 'low_activity' => 'Poca actividad → densidad calórica moderada, más volumen de verduras.'],
+        'zh' => ['equilibrio_limited' => '平衡（数据有限）', 'no_health_data' => '没有最新健康数据：根据个人资料估算预算。请输入 kcal/步数或连接 Health Bridge。', 'ricarica' => '活动后补充', 'high_activity' => '今天活动量大 → 更高能量和蛋白质的餐食。', 'leggero' => '轻食日', 'low_activity' => '活动量少 → 适度热量密度，多吃蔬菜增加体积。'],
+    ];
+    $hl = $healthLabels[$lang] ?? $healthLabels['en'];
+
+    if ($noData) {
+        $intent = 'equilibrio';
+        $label = $hl['equilibrio_limited'];
+        $notes[] = $hl['no_health_data'];
+    } elseif ($highActivity) {
+        $intent = 'ricarica';
+        $label = $hl['ricarica'];
+        $share = min(0.42, $share + 0.05);
+        $notes[] = $hl['high_activity'];
+    } elseif ($lowActivity) {
+        $intent = 'leggero';
+        $label = $hl['leggero'];
+        $share = max(0.22, $share - 0.05);
+        $notes[] = $hl['low_activity'];
+    }
+
+    if ($sleep !== null && $sleep < 6) {
+        $notes[] = 'Sonno basso: preferisci un piatto semplice e caldo, max ~25 min.';
+        if ($intent === 'equilibrio') {
+            $intent = 'comfort';
+            $label = 'Comfort smart';
+        }
+    }
+
+    if (in_array('pocafame', $options, true)) {
+        $share *= 0.7;
+        $notes[] = 'Opzione Poca Fame attiva: porzione ridotta.';
+    }
+    if (in_array('salutare', $options, true)) {
+        $notes[] = 'Extra salutare: prediligi verdure, cereali integrali, pochi grassi saturi.';
+    }
+
+    $targetKcalRaw = (int)max(180, round($tdee * $share));
+
+    $eatenKcal = (float)($eaten['kcal'] ?? 0);
+    $eatenProt = (float)($eaten['protein_g'] ?? 0);
+    $remainingKcal = (int)max(0, round($tdee - $eatenKcal));
+
+    // Redistribute remaining kcal across meals still ahead (+ current meal)
+    $mainShares = [
+        'colazione' => $shares['colazione'],
+        'pranzo' => $shares['pranzo'],
+        'cena' => $shares['cena'],
+    ];
+    $pool = [];
+    foreach ($mainShares as $type => $w) {
+        if ($type === $meal) {
+            $pool[$type] = $share;
+            continue;
+        }
+        if (in_array($type, $coveredTypes, true)) {
+            continue;
+        }
+        $pool[$type] = $w;
+    }
+    if (!isset($mainShares[$meal])) {
+        $pool = [$meal => $share];
+        foreach ($mainShares as $type => $w) {
+            if (!in_array($type, $coveredTypes, true)) {
+                $pool[$type] = $w;
+            }
+        }
+    }
+    $poolSum = array_sum($pool);
+    if ($poolSum <= 0) {
+        $pool = [$meal => 1.0];
+        $poolSum = 1.0;
+    }
+    $mealWeight = $pool[$meal] ?? $share;
+    if ($remainingKcal <= 0) {
+        $targetKcal = 120;
+        $intent = 'leggero';
+        $label = 'Budget giornaliero esaurito';
+        $notes[] = 'Budget kcal giornaliero già raggiunto/superato: proponi un pasto molto leggero (volume verdure, poche kcal).';
+    } else {
+        $targetKcal = (int)max(150, round($remainingKcal * ($mealWeight / $poolSum)));
+        if ($remainingKcal < 200) {
+            $targetKcal = (int)max(120, $remainingKcal);
+            $intent = 'leggero';
+            $label = 'Quasi a target giornaliero';
+            $notes[] = 'Hai già consumato quasi tutto il budget giornaliero: pasto leggero / volume verdure.';
+        } elseif ($eatenKcal >= 50) {
+            $notes[] = 'Già consumato oggi ~' . (int)round($eatenKcal) . ' kcal'
+                . ((int)round($eatenProt) > 0 ? (' / ~' . (int)round($eatenProt) . ' g proteine') : '')
+                . ' — budget di questo pasto ricalcolato sul rimanente (' . $remainingKcal . ' kcal).';
+        }
+    }
+
+    $weight = (float)($profile['weight_kg'] ?? $daily['weight_kg'] ?? 70);
+    $protPerKg = $intent === 'ricarica' ? 1.8 : ($intent === 'leggero' ? 1.2 : 1.4);
+    $dailyProt = (int)round($weight * $protPerKg);
+    $remainingProt = (int)max(0, round($dailyProt - $eatenProt));
+    $protein = (int)max(10, round($remainingProt * ($mealWeight / $poolSum)));
+    if ($remainingKcal < 200) {
+        $protein = (int)max(8, min($protein, 25));
+    }
+
+    $carbs = 'medi';
+    $fat = 'moderati';
+    if ($intent === 'ricarica') {
+        $carbs = 'medi-alti';
+        $fat = 'moderati';
+    } elseif ($intent === 'leggero') {
+        $carbs = 'moderati-bassi';
+        $fat = 'bassi';
+    }
+
+    $available = !$noData || !empty($profile['weight_kg']) || !empty($profile['daily_kcal_override']);
+
+    $eatenTitles = [];
+    foreach (array_slice($mealsToday, 0, 8) as $m) {
+        $t = trim((string)($m['title'] ?? ''));
+        if ($t === '') {
+            continue;
+        }
+        $k = $m['kcal'] !== null ? ((int)round((float)$m['kcal']) . ' kcal') : '? kcal';
+        $eatenTitles[] = $t . ' (' . $k . ')';
+    }
+
+    return [
+        'available' => $available,
+        'intent' => $intent,
+        'label' => $label,
+        'target_kcal' => $targetKcal,
+        'target_kcal_raw' => $targetKcalRaw,
+        'protein_g' => $protein,
+        'carbs' => $carbs,
+        'fat' => $fat,
+        'notes' => $notes,
+        'daily' => $daily,
+        'tdee' => $tdee,
+        'meal_share' => round($share, 3),
+        'date' => healthTodayDate(),
+        'has_fresh_data' => !$noData,
+        'goal' => $goal,
+        'eaten_today' => $eaten,
+        'remaining_kcal' => $remainingKcal,
+        'remaining_protein_g' => $remainingProt,
+        'meals_covered' => $coveredTypes,
+        'eaten_items' => $eatenTitles,
+        'profile' => [
+            'sex' => $profile['sex'] ?? null,
+            'weight_kg' => $profile['weight_kg'] ?? null,
+            'goal' => $goal,
+            'activity_default' => $profile['activity_default'] ?? null,
+        ],
+    ];
+}
+
+/** Prompt block for Gemini when Fuel Mode is on. */
+function healthFuelPromptBlock(array $budget, string $lang = 'en'): string {
+    if (empty($budget)) {
+        return '';
+    }
+    $notes = '';
+    if (!empty($budget['notes'])) {
+        $notes = "\n- note: " . implode(' | ', $budget['notes']);
+    }
+    $dailyBits = [];
+    $d = $budget['daily'] ?? null;
+    if (is_array($d)) {
+        if ($d['burned_kcal'] !== null) {
+            $dailyBits[] = 'kcal bruciate ~' . (int)round((float)$d['burned_kcal']);
+        }
+        if ($d['active_kcal'] !== null) {
+            $dailyBits[] = 'kcal attive ~' . (int)round((float)$d['active_kcal']);
+        }
+        if (!empty($d['steps'])) {
+            $dailyBits[] = (int)$d['steps'] . ' passi';
+        }
+        if (!empty($d['exercise_min'])) {
+            $dailyBits[] = (int)$d['exercise_min'] . ' min movimento';
+        }
+        if (!empty($d['exercise_types']) && is_array($d['exercise_types'])) {
+            $dailyBits[] = 'tipi: ' . implode(', ', array_slice($d['exercise_types'], 0, 4));
+        }
+        if (!empty($d['distance_m'])) {
+            $dailyBits[] = round((int)$d['distance_m'] / 1000, 1) . ' km';
+        }
+        if (!empty($d['floors'])) {
+            $dailyBits[] = (int)$d['floors'] . ' piani';
+        }
+        if ($d['sleep_hours'] !== null) {
+            $dailyBits[] = 'sonno ' . round((float)$d['sleep_hours'], 1) . 'h';
+        }
+        if (!empty($d['resting_hr'])) {
+            $dailyBits[] = 'FC riposo ' . (int)$d['resting_hr'];
+        }
+    }
+    $todayLine = $dailyBits ? ("\n- oggi (attività): " . implode(', ', $dailyBits)) : '';
+    $eaten = $budget['eaten_today'] ?? null;
+    $eatenLine = '';
+    if (is_array($eaten) && (int)($eaten['count'] ?? 0) > 0) {
+        $eatenLine = "\n- GIÀ CONSUMATO OGGI (ricette cucinate + usi dispensa): ~"
+            . (int)round((float)($eaten['kcal'] ?? 0)) . ' kcal'
+            . ', proteine ~' . (int)round((float)($eaten['protein_g'] ?? 0)) . ' g'
+            . ', carb ~' . (int)round((float)($eaten['carbs_g'] ?? 0)) . ' g'
+            . ', grassi ~' . (int)round((float)($eaten['fat_g'] ?? 0)) . ' g'
+            . ' (' . (int)$eaten['count'] . ' voci)';
+        $items = $budget['eaten_items'] ?? [];
+        if (is_array($items) && $items) {
+            $eatenLine .= "\n- dettagli consumi: " . implode('; ', array_slice($items, 0, 6));
+        }
+        if (isset($budget['remaining_kcal'])) {
+            $eatenLine .= "\n- rimanente giornata: " . (int)$budget['remaining_kcal'] . ' kcal'
+                . (isset($budget['remaining_protein_g']) ? (' / proteine rimanenti ~' . (int)$budget['remaining_protein_g'] . ' g') : '');
+        }
+    }
+    $kcal = (int)$budget['target_kcal'];
+    $prot = (int)$budget['protein_g'];
+    $lo = (int)round($kcal * 0.85);
+    $hi = (int)round($kcal * 1.15);
+    $goal = $budget['goal'] ?? 'maintain';
+    $goalLines = [
+        'it' => ['lose' => 'obiettivo profilo: DIMAGRIMENTO (deficit controllato, priorità proteine e volume verdure)', 'gain' => 'obiettivo profilo: MASSA (surplus leggero, proteine alte, carb sufficienti)', 'maintain' => 'obiettivo profilo: MANTENIMENTO (equilibrio kcal/macro)'],
+        'en' => ['lose' => 'profile goal: WEIGHT LOSS (controlled deficit, prioritize protein and vegetable volume)', 'gain' => 'profile goal: MUSCLE GAIN (slight surplus, high protein, sufficient carbs)', 'maintain' => 'profile goal: MAINTENANCE (kcal/macro balance)'],
+        'de' => ['lose' => 'Profilziel: ABNEHMEN (kontrolliertes Defizit, Proteine und Gemüsevolumen priorisieren)', 'gain' => 'Profilziel: MUSKELAUFBAU (leichter Überschuss, hohe Proteinzufuhr, ausreichend Kohlenhydrate)', 'maintain' => 'Profilziel: ERHALTUNG (kcal/Makro-Gleichgewicht)'],
+        'fr' => ['lose' => 'objectif profil : PERTE DE POIDS (déficit contrôlé, priorité protéines et volume légumes)', 'gain' => 'objectif profil : PRISE DE MASSE (léger surplus, protéines élevées, glucides suffisants)', 'maintain' => 'objectif profil : MAINTIEN (équilibre kcal/macros)'],
+        'es' => ['lose' => 'objetivo perfil: PÉRDIDA DE PESO (déficit controlado, priorizar proteínas y volumen de verduras)', 'gain' => 'objetivo perfil: GANANCIA MUSCULAR (superávit ligero, proteínas altas, carbohidratos suficientes)', 'maintain' => 'objetivo perfil: MANTENIMIENTO (equilibrio kcal/macros)'],
+        'zh' => ['lose' => '个人目标：减重（控制热量缺口，优先蛋白质和蔬菜体积）', 'gain' => '个人目标：增肌（轻微热量盈余，高蛋白，足够碳水）', 'maintain' => '个人目标：维持（kcal/营养素平衡）'],
+    ];
+    $gl = $goalLines[$lang] ?? $goalLines['en'];
+    $goalLine = match ($goal) {
+        'lose' => $gl['lose'],
+        'gain' => $gl['gain'],
+        default => $gl['maintain'],
+    };
+
+    $fuelLabels = [
+        'it' => [
+            'header' => "MEAL BUDGET / A RITMO MIO (obbligatorio: ricetta guidata da profilo biologico + obiettivo + attività di oggi + ciò che HAI GIÀ MANGIATO OGGI; rispetta ±15% sulle kcal; non inventare dati salute):",
+            'intent' => 'intent pasto oggi',
+            'target' => 'target_kcal per QUESTO pasto (già scontato i consumi di oggi)',
+            'acceptable' => 'accettabile',
+            'tdee' => 'TDEE / budget giornaliero',
+            'build' => 'Costruisci il piatto ESPLICITAMENTE per questo budget (non un piatto generico).',
+            'no_overload' => 'NON sovraccaricare: se già hai consumato molto oggi, fai un pasto più leggero e bilancia i macro rimanenti.',
+            'fuel_why' => 'Obbligatorio: campo `fuel_why` (2–4 frasi nella lingua della ricetta) che spiega PERCHÉ hai scelto QUEGLI ingredienti in base a: obiettivo profilo, attività/sonno di oggi, cosa già mangiato oggi, intent del pasto, e vincoli dispensa/scadenze. Cita 2–4 ingredienti concreti e il motivo (es. proteine post-allenamento, carb per ricarica, verdure per volume a basso kcal).',
+            'nutrition_note' => 'In nutrition_note una frase sul match kcal/macro. I valori in `nutrition` devono avvicinarsi al target.',
+        ],
+        'en' => [
+            'header' => "MEAL BUDGET / MY PACE (mandatory: recipe driven by biological profile + goal + today's activity + what you HAVE ALREADY EATEN TODAY; respect ±15% on kcal; do not invent health data):",
+            'intent' => 'meal intent today',
+            'target' => 'target_kcal for THIS meal (already deducted today\'s consumption)',
+            'acceptable' => 'acceptable',
+            'tdee' => 'TDEE / daily budget',
+            'build' => 'Build the dish EXPLICITLY for this budget (not a generic dish).',
+            'no_overload' => 'DO NOT overload: if you have already consumed a lot today, make a lighter meal and balance remaining macros.',
+            'fuel_why' => 'Mandatory: `fuel_why` field (2–4 sentences in recipe language) explaining WHY you chose THOSE ingredients based on: profile goal, today\'s activity/sleep, what already eaten today, meal intent, and pantry/expiry constraints. Cite 2–4 specific ingredients and the reason (e.g. protein post-workout, carbs for recharge, vegetables for low-kcal volume).',
+            'nutrition_note' => 'In nutrition_note one sentence about kcal/macro match. Values in `nutrition` must approach the target.',
+        ],
+        'de' => [
+            'header' => "MEAL BUDGET / MEIN TEMPO (Pflicht: Rezept gesteuert durch biologisches Profil + Ziel + heutige Aktivität + was du HEUTE SCHON GEGESSEN HAST; ±15% bei kcal einhalten; keine Gesundheitsdaten erfinden):",
+            'intent' => 'Mahlzeit-Intent heute',
+            'target' => 'target_kcal für DIESE Mahlzeit (bereits abzüglich heutiger Konsum)',
+            'acceptable' => 'akzeptabel',
+            'tdee' => 'TDEE / Tagesbudget',
+            'build' => 'Baue das Gericht EXPLIZIT für dieses Budget (kein generisches Gericht).',
+            'no_overload' => 'NICHT überladen: wenn du heute bereits viel gegessen hast, mache eine leichtere Mahlzeit und gleiche die restlichen Makros aus.',
+            'fuel_why' => 'Pflicht: `fuel_why`-Feld (2–4 Sätze in Rezeptsprache) das erklärt WARUM du DIESE Zutaten gewählt hast.',
+            'nutrition_note' => 'In nutrition_note ein Satz zum kcal/Makro-Match. Werte in `nutrition` müssen sich dem Ziel nähern.',
+        ],
+        'fr' => [
+            'header' => "MEAL BUDGET / MON RYTHME (obligatoire : recette guidée par profil biologique + objectif + activité du jour + ce que vous AVEZ DÉJÀ MANGÉ AUJOURD'HUI ; respecter ±15% sur les kcal ; ne pas inventer de données santé) :",
+            'intent' => 'intention repas aujourd\'hui',
+            'target' => 'target_kcal pour CE repas (déjà déduit la consommation d\'aujourd\'hui)',
+            'acceptable' => 'acceptable',
+            'tdee' => 'TDEE / budget journalier',
+            'build' => 'Construis le plat EXPLICITEMENT pour ce budget (pas un plat générique).',
+            'no_overload' => 'NE PAS surcharger : si vous avez déjà beaucoup consommé aujourd\'hui, faites un repas plus léger et équilibrez les macros restantes.',
+            'fuel_why' => 'Obligatoire : champ `fuel_why` (2–4 phrases dans la langue de la recette) expliquant POURQUOI vous avez choisi CES ingrédients.',
+            'nutrition_note' => 'Dans nutrition_note une phrase sur le match kcal/macros. Les valeurs dans `nutrition` doivent se rapprocher de la cible.',
+        ],
+        'es' => [
+            'header' => "MEAL BUDGET / MI RITMO (obligatorio: receta guiada por perfil biológico + objetivo + actividad de hoy + lo que YA HAS COMIDO HOY; respetar ±15% en kcal; no inventar datos de salud):",
+            'intent' => 'intención de comida hoy',
+            'target' => 'target_kcal para ESTA comida (ya descontado el consumo de hoy)',
+            'acceptable' => 'aceptable',
+            'tdee' => 'TDEE / presupuesto diario',
+            'build' => 'Construye el plato EXPLÍCITAMENTE para este presupuesto (no un plato genérico).',
+            'no_overload' => 'NO sobrecargar: si ya has consumido mucho hoy, haz una comida más ligera y equilibra los macros restantes.',
+            'fuel_why' => 'Obligatorio: campo `fuel_why` (2–4 frases en el idioma de la receta) explicando POR QUÉ elegiste ESOS ingredientes.',
+            'nutrition_note' => 'En nutrition_note una frase sobre el ajuste kcal/macros. Los valores en `nutrition` deben acercarse al objetivo.',
+        ],
+        'zh' => [
+            'header' => "MEAL BUDGET / 我的节奏（必填：根据生物档案 + 目标 + 今天的活动 + 你今天已经吃了什么来指导食谱；遵守 ±15% 热量；不要编造健康数据）：",
+            'intent' => '今日餐食意图',
+            'target' => '此餐 target_kcal（已扣除今日消耗）',
+            'acceptable' => '可接受',
+            'tdee' => 'TDEE / 每日预算',
+            'build' => '明确按此预算构建菜肴（不是通用菜肴）。',
+            'no_overload' => '不要超载：如果今天已经吃了很多，做一顿更轻的餐并平衡剩余的营养素。',
+            'fuel_why' => '必填：`fuel_why` 字段（2-4 句，使用食谱语言）解释为什么选择这些食材。',
+            'nutrition_note' => '在 nutrition_note 中写一句关于 kcal/营养素匹配的话。`nutrition` 中的值必须接近目标。',
+        ],
+    ];
+    $fl = $fuelLabels[$lang] ?? $fuelLabels['en'];
+
+    return "\n\n🍽 {$fl['header']}\n"
+        . "- {$goalLine}\n"
+        . "- {$fl['intent']}: {$budget['intent']} ({$budget['label']})\n"
+        . "- {$fl['target']}: {$kcal} ({$fl['acceptable']} {$lo}–{$hi})\n"
+        . "- protein_g: ≥{$prot}\n"
+        . "- carbs: {$budget['carbs']}; fat: {$budget['fat']}\n"
+        . "- {$fl['tdee']}: {$budget['tdee']} kcal"
+        . $todayLine
+        . $eatenLine
+        . $notes
+        . "\n{$fl['build']}"
+        . "\n{$fl['no_overload']}"
+        . "\n{$fl['fuel_why']}"
+        . "\n{$fl['nutrition_note']}";
+}
+
+function healthHashToken(string $token): string {
+    return hash('sha256', $token);
+}
+
+function healthCreateBridgeToken(PDO $db, string $label = 'Health Bridge'): array {
+    healthEnsureTables($db);
+    $plain = 'es_health_' . bin2hex(random_bytes(24));
+    $hash = healthHashToken($plain);
+    $now = date('c');
+    $db->prepare('INSERT INTO health_tokens (token_hash, label, created_at) VALUES (?, ?, ?)')
+        ->execute([$hash, $label !== '' ? $label : 'Health Bridge', $now]);
+    $id = (int)$db->lastInsertId();
+    return [
+        'id' => $id,
+        'token' => $plain,
+        'label' => $label !== '' ? $label : 'Health Bridge',
+        'created_at' => $now,
+    ];
+}
+
+function healthListBridgeTokens(PDO $db): array {
+    healthEnsureTables($db);
+    $rows = $db->query('SELECT id, label, created_at, last_used_at, revoked_at FROM health_tokens ORDER BY id DESC')->fetchAll(PDO::FETCH_ASSOC);
+    return array_map(static function ($r) {
+        return [
+            'id' => (int)$r['id'],
+            'label' => $r['label'],
+            'created_at' => $r['created_at'],
+            'last_used_at' => $r['last_used_at'],
+            'revoked' => !empty($r['revoked_at']),
+            'revoked_at' => $r['revoked_at'],
+        ];
+    }, $rows);
+}
+
+function healthRevokeBridgeToken(PDO $db, ?int $id = null): int {
+    healthEnsureTables($db);
+    $now = date('c');
+    if ($id !== null && $id > 0) {
+        $stmt = $db->prepare('UPDATE health_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL');
+        $stmt->execute([$now, $id]);
+        return $stmt->rowCount();
+    }
+    $stmt = $db->prepare('UPDATE health_tokens SET revoked_at = ? WHERE revoked_at IS NULL');
+    $stmt->execute([$now]);
+    return $stmt->rowCount();
+}
+
+function healthBridgeTokenValid(PDO $db, string $token): bool {
+    if ($token === '' || !str_starts_with($token, 'es_health_')) {
+        return false;
+    }
+    healthEnsureTables($db);
+    $hash = healthHashToken($token);
+    $stmt = $db->prepare('SELECT id FROM health_tokens WHERE token_hash = ? AND revoked_at IS NULL LIMIT 1');
+    $stmt->execute([$hash]);
+    $id = $stmt->fetchColumn();
+    if (!$id) {
+        return false;
+    }
+    $db->prepare('UPDATE health_tokens SET last_used_at = ? WHERE id = ?')->execute([date('c'), $id]);
+    return true;
+}
+
+function healthStatusPayload(PDO $db): array {
+    $profile = healthGetProfile($db);
+    $daily = healthGetDaily($db);
+    $tokens = healthListBridgeTokens($db);
+    $activeTokens = array_values(array_filter($tokens, static fn($t) => empty($t['revoked'])));
+    $budgetPreview = computeMealBudget($db, 'pranzo', []);
+    $mealsToday = healthGetMealsForDate($db, healthTodayDate());
+    $eaten = healthMealsTotals($mealsToday);
+    $tdee = (int)($budgetPreview['tdee'] ?? 0);
+    return [
+        'success' => true,
+        'today' => healthTodayDate(),
+        'profile' => $profile,
+        'daily' => $daily,
+        'bridge_linked' => count($activeTokens) > 0,
+        'bridge_tokens' => $tokens,
+        'budget_preview' => $budgetPreview,
+        'meals_today' => $mealsToday,
+        'eaten_today' => $eaten,
+        'remaining_kcal' => $tdee > 0 ? max(0, $tdee - (int)round($eaten['kcal'])) : null,
+    ];
+}
+
+/** Logged meals for a calendar day (newest first). */
+function healthGetMealsForDate(PDO $db, string $date): array {
+    healthEnsureTables($db);
+    $stmt = $db->prepare('SELECT * FROM health_meals WHERE date = ? ORDER BY id DESC');
+    $stmt->execute([$date]);
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
+    return array_map(static function (array $r): array {
+        return [
+            'id' => (int)$r['id'],
+            'date' => $r['date'],
+            'meal' => $r['meal'],
+            'title' => $r['title'],
+            'kcal' => $r['kcal'] !== null ? (float)$r['kcal'] : null,
+            'protein_g' => $r['protein_g'] !== null ? (float)$r['protein_g'] : null,
+            'carbs_g' => $r['carbs_g'] !== null ? (float)$r['carbs_g'] : null,
+            'fat_g' => $r['fat_g'] !== null ? (float)$r['fat_g'] : null,
+            'servings' => (float)$r['servings'],
+            'source' => $r['source'] ?? 'recipe',
+            'created_at' => $r['created_at'],
+        ];
+    }, $rows);
+}
+
+/** @param list<array> $meals */
+function healthMealsTotals(array $meals): array {
+    $kcal = 0.0;
+    $prot = 0.0;
+    $carbs = 0.0;
+    $fat = 0.0;
+    foreach ($meals as $m) {
+        $kcal += (float)($m['kcal'] ?? 0);
+        $prot += (float)($m['protein_g'] ?? 0);
+        $carbs += (float)($m['carbs_g'] ?? 0);
+        $fat += (float)($m['fat_g'] ?? 0);
+    }
+    return [
+        'kcal' => round($kcal, 1),
+        'protein_g' => round($prot, 1),
+        'carbs_g' => round($carbs, 1),
+        'fat_g' => round($fat, 1),
+        'count' => count($meals),
+    ];
+}
+
+/**
+ * Log consumed meal from EverShelf only (recipe cook or inventory use) — no manual diary.
+ * Recipe: one entry per title/day. Use: additive per product use.
+ * @return array{success:bool,meal?:array,error?:string,eaten_today?:array,remaining_kcal?:int|null,skipped?:bool}
+ */
+function healthLogMeal(PDO $db, array $input): array {
+    healthEnsureTables($db);
+    if (env('HEALTH_ENABLED', 'false') !== 'true') {
+        return ['success' => false, 'error' => 'health_disabled'];
+    }
+    $title = trim((string)($input['title'] ?? ''));
+    if ($title === '') {
+        return ['success' => false, 'error' => 'title_required'];
+    }
+    $source = strtolower(trim((string)($input['source'] ?? 'recipe')));
+    if (!in_array($source, ['recipe', 'use'], true)) {
+        $source = 'recipe';
+    }
+    $meal = strtolower(trim((string)($input['meal'] ?? 'pranzo')));
+    $allowed = ['colazione', 'pranzo', 'cena', 'dolce', 'succo', 'altro'];
+    if (!in_array($meal, $allowed, true)) {
+        $meal = 'altro';
+    }
+    $servings = (float)($input['servings'] ?? 1);
+    if ($servings <= 0) {
+        $servings = 1;
+    }
+    if ($servings > 10) {
+        $servings = 10;
+    }
+    $date = trim((string)($input['date'] ?? ''));
+    if ($date === '' || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+        $date = healthTodayDate();
+    }
+
+    // Recipe: log once per title/day (first ingredient use wins)
+    if ($source === 'recipe') {
+        $dup = $db->prepare('SELECT id FROM health_meals WHERE date = ? AND source = ? AND title = ? LIMIT 1');
+        $dup->execute([$date, 'recipe', mb_substr($title, 0, 200)]);
+        if ($dup->fetchColumn()) {
+            $meals = healthGetMealsForDate($db, $date);
+            $eaten = healthMealsTotals($meals);
+            $budget = computeMealBudget($db, $meal === 'altro' ? 'pranzo' : $meal, []);
+            $tdee = (int)($budget['tdee'] ?? 0);
+            return [
+                'success' => true,
+                'skipped' => true,
+                'eaten_today' => $eaten,
+                'remaining_kcal' => $tdee > 0 ? max(0, $tdee - (int)round($eaten['kcal'])) : null,
+                'tdee' => $tdee,
+            ];
+        }
+    }
+
+    $kcal = isset($input['kcal']) && $input['kcal'] !== '' && $input['kcal'] !== null
+        ? (float)$input['kcal'] * $servings : null;
+    $prot = isset($input['protein_g']) && $input['protein_g'] !== '' && $input['protein_g'] !== null
+        ? (float)$input['protein_g'] * $servings : null;
+    $carbs = isset($input['carbs_g']) && $input['carbs_g'] !== '' && $input['carbs_g'] !== null
+        ? (float)$input['carbs_g'] * $servings : null;
+    $fat = isset($input['fat_g']) && $input['fat_g'] !== '' && $input['fat_g'] !== null
+        ? (float)$input['fat_g'] * $servings : null;
+
+    $now = date('c');
+    $db->prepare('INSERT INTO health_meals
+        (date, meal, title, kcal, protein_g, carbs_g, fat_g, servings, source, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)')
+        ->execute([$date, $meal, mb_substr($title, 0, 200), $kcal, $prot, $carbs, $fat, $servings, $source, $now]);
+    $id = (int)$db->lastInsertId();
+    $meals = healthGetMealsForDate($db, $date);
+    $eaten = healthMealsTotals($meals);
+    $budget = computeMealBudget($db, $meal === 'altro' ? 'pranzo' : $meal, []);
+    $tdee = (int)($budget['tdee'] ?? 0);
+    return [
+        'success' => true,
+        'meal' => [
+            'id' => $id,
+            'date' => $date,
+            'meal' => $meal,
+            'title' => $title,
+            'kcal' => $kcal,
+            'protein_g' => $prot,
+            'carbs_g' => $carbs,
+            'fat_g' => $fat,
+            'servings' => $servings,
+            'source' => $source,
+            'created_at' => $now,
+        ],
+        'eaten_today' => $eaten,
+        'remaining_kcal' => $tdee > 0 ? max(0, $tdee - (int)round($eaten['kcal'])) : null,
+        'tdee' => $tdee,
+    ];
+}
+
+/**
+ * Estimate kcal from a pantry use (not recipe / not waste) and log silently.
+ */
+function healthLogInventoryUse(PDO $db, int $productId, float $qty, string $notes, ?array $prodInfo = null): void {
+    if (env('HEALTH_ENABLED', 'false') !== 'true' || $productId <= 0 || $qty <= 0) {
+        return;
+    }
+    if ($notes !== '' && (str_starts_with($notes, 'Ricetta:') || str_starts_with($notes, 'Recipe:'))) {
+        return; // recipe nutrition logged separately when cooking
+    }
+    if (function_exists('_isWasteNotes') && _isWasteNotes($notes)) {
+        return;
+    }
+    if (!$prodInfo) {
+        $stmt = $db->prepare('SELECT name, category, unit, default_quantity, nutriments_json FROM products WHERE id = ?');
+        $stmt->execute([$productId]);
+        $prodInfo = $stmt->fetch(PDO::FETCH_ASSOC) ?: null;
+    }
+    if (!$prodInfo) {
+        return;
+    }
+    $est = healthEstimateProductMacros($prodInfo, $qty);
+    if ($est['kcal'] === null || $est['kcal'] <= 0) {
+        return;
+    }
+    healthLogMeal($db, [
+        'title' => (string)($prodInfo['name'] ?? 'Uso dispensa'),
+        'meal' => 'altro',
+        'source' => 'use',
+        'kcal' => $est['kcal'],
+        'protein_g' => $est['protein_g'],
+        'carbs_g' => $est['carbs_g'],
+        'fat_g' => $est['fat_g'],
+        'servings' => 1,
+    ]);
+}
+
+/** @return array{kcal:?float,protein_g:?float,carbs_g:?float,fat_g:?float} */
+function healthEstimateProductMacros(array $prod, float $qty): array {
+    $catDefaults = [
+        'frutta' => 52, 'verdura' => 30, 'carne' => 200, 'pesce' => 130, 'latticini' => 150,
+        'pasta' => 350, 'pane' => 265, 'cereali' => 370, 'bevande' => 40, 'condimenti' => 150,
+        'conserve' => 80, 'surgelati' => 100, 'snack' => 480, 'altro' => 150,
+    ];
+    $protDef = [
+        'carne' => 20, 'pesce' => 20, 'latticini' => 8, 'pasta' => 12, 'pane' => 9, 'cereali' => 10, 'altro' => 4,
+    ];
+    $unit = $prod['unit'] ?? 'pz';
+    $defQty = (float)($prod['default_quantity'] ?? 0);
+    $grams = 100.0;
+    if ($unit === 'g') {
+        $grams = $qty;
+    } elseif ($unit === 'kg') {
+        $grams = $qty * 1000;
+    } elseif ($unit === 'ml') {
+        $grams = $qty;
+    } elseif ($unit === 'l') {
+        $grams = $qty * 1000;
+    } elseif (in_array($unit, ['pz', 'conf'], true) && $defQty >= 20) {
+        $grams = $qty * $defQty;
+    } elseif (in_array($unit, ['pz', 'conf'], true)) {
+        $grams = $qty * max(40, $defQty > 0 ? $defQty : 100);
+    }
+
+    $kcal100 = null;
+    $prot100 = null;
+    $carb100 = null;
+    $fat100 = null;
+    if (!empty($prod['nutriments_json'])) {
+        $nm = json_decode((string)$prod['nutriments_json'], true);
+        if (is_array($nm)) {
+            $kcal100 = isset($nm['energy-kcal_100g']) ? (float)$nm['energy-kcal_100g']
+                : (isset($nm['energy_kcal_100g']) ? (float)$nm['energy_kcal_100g'] : null);
+            $prot100 = isset($nm['proteins_100g']) ? (float)$nm['proteins_100g'] : null;
+            $carb100 = isset($nm['carbohydrates_100g']) ? (float)$nm['carbohydrates_100g'] : null;
+            $fat100 = isset($nm['fat_100g']) ? (float)$nm['fat_100g'] : null;
+        }
+    }
+    $cat = strtolower(trim((string)($prod['category'] ?? 'altro')));
+    if ($kcal100 === null) {
+        $kcal100 = (float)($catDefaults[$cat] ?? $catDefaults['altro']);
+    }
+    if ($prot100 === null) {
+        $prot100 = (float)($protDef[$cat] ?? 4);
+    }
+    $factor = $grams / 100.0;
+    return [
+        'kcal' => round($kcal100 * $factor, 1),
+        'protein_g' => round($prot100 * $factor, 1),
+        'carbs_g' => $carb100 !== null ? round($carb100 * $factor, 1) : null,
+        'fat_g' => $fat100 !== null ? round($fat100 * $factor, 1) : null,
+    ];
+}

@@ -62,7 +62,7 @@ export async function accueil(racine) {
       bouton("Envoyer", "rien", { classe: "bouton bouton-ligne", attrs: { type: "submit" } }),
     ]}),
     entendu ? dom("p", { classe: "detail", texte: `Entendu : ${entendu.texte}` }) : null,
-    dernier ? dom("article", { classe: "reponse", enfants: [dom("p", { texte: dernier.texte })] }) : dom("p", { classe: "detail", texte: "Parle, ou écris. Jarvis transcrit puis décide quoi faire." }),
+    dernier ? dom("article", { classe: "reponse", enfants: [dom("p", { texte: dernier.texte })] }) : dom("p", { classe: "detail", texte: "Parle, ou écris. Jarvis comprend la phrase, puis met à jour le garde-manger." }),
   );
 }
 

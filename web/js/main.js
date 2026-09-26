@@ -423,7 +423,7 @@ document.body.addEventListener("pointerdown", (evenement) => {
 
 window.addEventListener("hashchange", rendre);
 if (!location.hash) location.replace("#/");
-rendre();
+else rendre();
 
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js");

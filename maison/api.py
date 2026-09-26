@@ -5,6 +5,8 @@ from datetime import date
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
+from cerveau.etageres import liste_courses
+from cerveau.pipeline import discuter as discuter_jarvis
 from maison import assistant, config, courses, foyer, ocr, produits, rappels, voix
 from maison.db import ouvrir
 from maison.erreurs import ErreurMaison
@@ -629,6 +631,12 @@ def supprimer_date(date_id: int):
     return {"ok": True}
 
 
+@routeur.get("/etageres/courses")
+def courses_garde_manger():
+    """La liste tenue par EverShelf, pas le brouillon interne."""
+    return liste_courses()
+
+
 @routeur.get("/messages")
 def messages():
     with ouvrir() as conn:
@@ -650,7 +658,7 @@ async def parler(audio: UploadFile = File(...), auteur: str = Form(default="")):
     if not transcription:
         raise ErreurMaison("Je n'ai pas distingué de phrase. Réessaie.")
     with ouvrir() as conn:
-        reponse = assistant.discuter(conn, transcription, auteur)
+        reponse = discuter_jarvis(conn, transcription, auteur)
         return {"transcription": transcription, "reponse": reponse, "messages": assistant.histoires(conn)}
 
 
@@ -659,7 +667,7 @@ def envoyer_message(corps: DireCorps):
     if not corps.texte.strip():
         raise ErreurMaison("Dis quelque chose")
     with ouvrir() as conn:
-        reponse = assistant.discuter(conn, corps.texte, corps.auteur)
+        reponse = discuter_jarvis(conn, corps.texte, corps.auteur)
         return {"reponse": reponse, "messages": assistant.histoires(conn)}
 
 

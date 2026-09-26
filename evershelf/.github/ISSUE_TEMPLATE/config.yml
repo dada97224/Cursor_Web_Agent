@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 Wiki & FAQ
+    url: https://github.com/dadaloop82/EverShelf/wiki/FAQ
+    about: Check the FAQ — your question may already be answered there.
+  - name: 💬 Discussions — Q&A
+    url: https://github.com/dadaloop82/EverShelf/discussions
+    about: General questions, show-and-tell, ideas — use Discussions, not Issues.
+  - name: 🔒 Security Vulnerability
+    url: mailto:evershelfproject@gmail.com
+    about: Please report security vulnerabilities privately via email, not as a public issue.

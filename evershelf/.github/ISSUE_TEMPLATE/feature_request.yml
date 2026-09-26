@@ -1,0 +1,68 @@
+name: Feature Request
+description: Suggest a new feature or improvement
+title: "[FEATURE] "
+labels: ["enhancement"]
+assignees: ["dadaloop82"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! Check the [Roadmap](https://github.com/dadaloop82/EverShelf/blob/main/README.md#-roadmap) and [Discussions](https://github.com/dadaloop82/EverShelf/discussions) first — it may already be planned or discussed.
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      options:
+        - Inventory management
+        - Shopping list
+        - AI / Gemini features
+        - Cooking mode
+        - Dashboard / stats
+        - Kiosk app
+        - Smart Scale
+        - Integrations (Bring!, HA, etc.)
+        - Performance / developer experience
+        - Translations / i18n
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Motivation
+      description: What pain point does this address? Why do you need this?
+      placeholder: "I'm always frustrated when..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: Describe what you'd like to see added or changed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Any workarounds you've tried, or other solutions you considered?
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Screenshots, mockups, links to similar features in other apps, etc.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I checked the Roadmap and this is not already planned
+          required: true
+        - label: I searched existing issues and discussions — this is not a duplicate
+          required: true

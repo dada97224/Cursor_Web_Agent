@@ -1,0 +1,97 @@
+name: Build & Release Kiosk APK
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'evershelf-kiosk/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Kiosk APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5.6.0
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.6'
+
+      - name: Get version name
+        id: version
+        run: |
+          VERSION=$(grep 'versionName' evershelf-kiosk/app/build.gradle.kts | grep -oP '"\K[^"]+')
+          VCODE=$(grep 'versionCode' evershelf-kiosk/app/build.gradle.kts | grep -oP '\d+')
+          echo "name=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "code=$VCODE" >> "$GITHUB_OUTPUT"
+          echo "Kiosk version: $VERSION (versionCode $VCODE)"
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+        working-directory: evershelf-kiosk
+
+      - name: Rename APK
+        run: |
+          mkdir -p artifacts
+          cp evershelf-kiosk/app/build/outputs/apk/debug/app-debug.apk artifacts/evershelf-kiosk.apk
+
+      # Publish with a semver-compatible tag so the in-app update check can
+      # compare versions numerically (tag "kiosk-1.7.0" → norm → "1.7.0").
+      # Also update the "kiosk-latest" tag so the hardcoded download URL still works.
+      - name: Create versioned release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="kiosk-${{ steps.version.outputs.name }}"
+          # Delete old release with same tag if it exists (e.g. re-run on same version)
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          git push --delete origin "$TAG" 2>/dev/null || true
+          gh release create "$TAG" \
+            --title "EverShelf Kiosk v${{ steps.version.outputs.name }}" \
+            --notes "Kiosk mode app. Scarica e installa su Android 7.0+. L'aggiornamento OTA è automatico." \
+            --latest \
+            artifacts/evershelf-kiosk.apk
+
+      - name: Update kiosk-latest tag (for hardcoded download URL)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete kiosk-latest --yes 2>/dev/null || true
+          git push --delete origin kiosk-latest 2>/dev/null || true
+          sleep 3
+          gh release create kiosk-latest \
+            --title "EverShelf Kiosk Latest" \
+            --notes "Auto alias → kiosk-${{ steps.version.outputs.name }} (versionCode ${{ steps.version.outputs.code }})" \
+            --prerelease \
+            artifacts/evershelf-kiosk.apk
+
+      - name: Publish APK to releases/ for LAN OTA
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          cp artifacts/evershelf-kiosk.apk releases/evershelf-kiosk.apk
+          printf '{"version":"%s","version_code":%s}\n' \
+            "${{ steps.version.outputs.name }}" "${{ steps.version.outputs.code }}" \
+            > releases/kiosk-version.json
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add releases/evershelf-kiosk.apk releases/kiosk-version.json
+          git diff --staged --quiet || git commit -m "chore(kiosk): publish APK v${{ steps.version.outputs.name }} for LAN OTA"
+          git push origin HEAD:${{ github.ref_name }}
+

@@ -1,0 +1,18 @@
+{
+    "name": "EverShelf",
+    "short_name": "EverShelf",
+    "description": "Gestione completa della dispensa di casa con scansione barcode",
+    "version": "1.8.5",
+    "start_url": ".",
+    "display": "standalone",
+    "background_color": "#f0f4e8",
+    "theme_color": "#2d5016",
+    "orientation": "portrait",
+    "icons": [
+        {
+            "src": "assets/img/logo/logo_icon.png",
+            "sizes": "any",
+            "type": "image/svg+xml"
+        }
+    ]
+}
