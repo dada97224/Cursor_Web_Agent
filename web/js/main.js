@@ -50,6 +50,7 @@ function domAttente() {
 async function choisir(page, id, params) {
   switch (page) {
     case "accueil": return vues.accueil(racine);
+    case "stock": return vues.stock(racine, id);
     case "cuisine": return vues.cuisine(racine, "cuisine");
     case "congelo": return vues.cuisine(racine, "congelo");
     case "courses": return vues.courses(racine);
@@ -77,7 +78,7 @@ async function choisir(page, id, params) {
 }
 
 function marquerNav(page) {
-  const actif = page === "congelo" ? "cuisine" : page;
+  const actif = page === "stock" ? "stock" : page === "accueil" ? "accueil" : page;
   for (const lien of document.querySelectorAll(".nav a")) {
     lien.classList.toggle("actif", lien.dataset.nav === actif);
   }
@@ -127,6 +128,8 @@ document.body.addEventListener("click", async (evenement) => {
         return;
       case "micro":
         ecouter();
+        return;
+      case "parler":
         return;
       case "personne":
         localStorage.setItem("maison.personne", boutonClique.dataset.id);
@@ -346,6 +349,42 @@ document.body.addEventListener("input", (evenement) => {
   for (const carte of document.querySelectorAll("[data-nom]")) {
     carte.hidden = !carte.dataset.nom.toLowerCase().includes(cherche);
   }
+});
+
+let parole = null;
+
+document.body.addEventListener("pointerdown", (evenement) => {
+  const boutonParler = evenement.target.closest("[data-action=parler]");
+  if (!boutonParler) return;
+  evenement.preventDefault();
+  if (!window.isSecureContext) {
+    montrerErreur(new Error("Le bouton micro ne marche qu'en adresse sécurisée, ou sur cet ordinateur en localhost. Sur le téléphone, utilise le micro du clavier."));
+    return;
+  }
+  const Reconnaissance = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!Reconnaissance) {
+    montrerErreur(new Error("Ce navigateur ne dicte pas. Chrome sur l'ordinateur sait le faire."));
+    return;
+  }
+  parole = new Reconnaissance();
+  parole.lang = "fr-FR";
+  boutonParler.classList.add("ecoute");
+  parole.onresult = async (resultat) => {
+    const texte = resultat.results[0][0].transcript;
+    const champTexte = document.querySelector("input[name=texte]");
+    if (champTexte) champTexte.value = texte;
+    sessionStorage.setItem("maison.voix", "1");
+    await api("/api/messages", { method: "POST", corps: { texte, auteur: personne().nom || "" } });
+    await rendre();
+  };
+  parole.start();
+});
+
+document.body.addEventListener("pointerup", () => {
+  if (!parole) return;
+  parole.stop();
+  parole = null;
+  document.querySelector(".ptt")?.classList.remove("ecoute");
 });
 
 window.addEventListener("hashchange", rendre);

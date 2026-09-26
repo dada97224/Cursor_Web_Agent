@@ -121,6 +121,11 @@ CREATE TABLE IF NOT EXISTS dates_famille (
     note TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS attente (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    contenu TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
     auteur TEXT NOT NULL,

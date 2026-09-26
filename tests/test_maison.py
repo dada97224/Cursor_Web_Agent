@@ -114,6 +114,25 @@ def test_conversation(client):
     assert "pain" in manque.json()["reponse"].lower()
 
 
+def test_liste_avec_precision(client):
+    phrase = "ajoute du lait, du pain de mie, des oeufs et du coca à la liste des courses de la semaine"
+    reponse = client.post("/api/messages", json={"texte": phrase}).json()["reponse"]
+    assert "6, 12 ou 24" in reponse
+    assert "2 litres" in reponse
+    noms = [ligne["nom"] for ligne in client.get("/api/courses").json()]
+    assert "Lait" in noms
+    assert "Pain de Mie" in noms
+    assert "Coca" in noms
+    assert "Œufs" not in noms
+    suite = client.post("/api/messages", json={"texte": "12"}).json()["reponse"]
+    assert "12" in suite
+    oeufs = next(ligne for ligne in client.get("/api/courses").json() if ligne["nom"] == "Œufs")
+    assert oeufs["quantite"] == 12
+    stock = client.post("/api/messages", json={"texte": "j'ai rangé la liste des courses, tu peux actualiser le stock"}).json()
+    assert "Stock actualisé" in stock["reponse"]
+    assert client.get("/api/courses").json() == []
+
+
 def test_menus_et_plante(client):
     semaine = client.get("/api/menus").json()
     assert len(semaine) == 7

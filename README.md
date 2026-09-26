@@ -2,7 +2,11 @@
 
 Application locale pour la maison. Elle tourne sur un ordinateur, et les téléphones du foyer l'ouvrent sur le Wi-Fi.
 
-On lui parle depuis l'accueil, au clavier ou au micro. Une photo de ticket remplit le stock. Une photo du frigo, quand les mots sont lisibles, sert à proposer une recette avec les étapes. « Où est le lait ? » et « range le lait dans le frigo » évitent de remplir des fiches.
+L'accueil est Jarvis : un bouton à maintenir pour parler, et un champ texte en dessous. Le stock s'ouvre à part, avec les catégories à gauche (frigo, congélateur, secs, réserves, pharmacie, entretien, courses).
+
+Le bouton micro utilise la dictée du navigateur. Elle ne marche qu'en contexte sécurisé : `localhost` sur l'ordinateur, ou HTTPS pour les téléphones. En HTTP sur le Wi-Fi, c'est le micro du clavier. Une dictée locale (faster-whisper, modèle `small`, français, CPU) peut venir ensuite, une fois le micro autorisé.
+
+Les tickets passent par Tesseract (`--psm 4`). Les QR codes et les codes-barres passent par ZBar, sur la même photo. Une photo du frigo sans texte lisible n'est pas reconnue : il n'y a pas de modèle de vision installé.
 
 Les listes (courses, pharmacie, ménage, animaux, dates, plantes simples) restent derrière Maison. Le module plantes détaillé viendra à part.
 

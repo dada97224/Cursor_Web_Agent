@@ -66,7 +66,12 @@ def score_noms(a: str, b: str) -> float:
 
 
 def presenter_nom(nom: str) -> str:
-    return " ".join(part.capitalize() for part in nom.split())
+    petits = {"de", "du", "des", "et", "la", "le", "les"}
+    mots = nom.split()
+    return " ".join(
+        mot if index and mot.lower() in petits else mot.capitalize()
+        for index, mot in enumerate(mots)
+    )
 
 
 def nombre(valeur: float) -> int | float:

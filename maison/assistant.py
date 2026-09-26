@@ -1,5 +1,6 @@
 """On parle à la maison en français, elle range et répond."""
 
+import json
 import re
 
 from maison import courses, foyer, ocr, produits
@@ -57,11 +58,46 @@ def _assurer(conn, nom: str, quantite: float, etat: str, photo: str | None = Non
     })
 
 
+# Une question ouverte vaut mieux qu'une quantité inventée.
+_PRECISIONS = [
+    ("pain de mie", {"nom": "Pain de mie", "quantite": 1, "unite": "paquet"}),
+    ("oeuf", {"question": "Pour les œufs : 6, 12 ou 24 ?", "choix": [6, 12, 24], "nom": "Œufs", "unite": "pièce"}),
+    ("coca", {"nom": "Coca", "quantite": 1, "unite": "bouteille", "suppose": "Le Coca, je pars sur 2 litres."}),
+    ("lait", {"nom": "Lait", "quantite": 1, "unite": "pack", "suppose": "Un pack de lait."}),
+]
+
+
 def _noms(fragment: str) -> list[str]:
-    sans = _ARTICLE.sub(" ", plier(fragment))
-    sans = re.sub(r"\b(range|mets|pose|met|est|sont|ou|achete|ramene|jai|ai|on)\b", " ", sans)
-    morceaux = re.split(r",|;|\bet\b", sans)
-    return [morceau.strip(" .?!") for morceau in morceaux if len(morceau.strip(" .?!")) >= 3]
+    morceaux = re.split(r",|;|\bet\b", plier(fragment))
+    resultat = []
+    for morceau in morceaux:
+        morceau = _ARTICLE.sub(" ", morceau)
+        morceau = re.sub(
+            r"\b(ajoute|ajout|liste|courses|semaine|range|mets|pose|met|est|sont|ou|achete|ramene|jai|ai|on|actualise|stock)\b",
+            " ",
+            morceau,
+        )
+        morceau = re.sub(r"^(de|d)\s+", "", " ".join(morceau.split()))
+        if len(morceau) >= 3:
+            resultat.append(morceau)
+    return resultat
+
+
+def _lire_attente(conn) -> dict | None:
+    row = conn.execute("SELECT contenu FROM attente WHERE id = 1").fetchone()
+    if not row:
+        return None
+    return json.loads(row["contenu"])
+
+
+def _ecrire_attente(conn, contenu: dict | None) -> None:
+    if not contenu:
+        conn.execute("DELETE FROM attente WHERE id = 1")
+        return
+    conn.execute(
+        "INSERT INTO attente (id, contenu) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET contenu = excluded.contenu",
+        (json.dumps(contenu),),
+    )
 
 
 def _noter(conn, auteur: str, role: str, texte: str, photo: str | None = None) -> None:
@@ -88,6 +124,9 @@ def histoires(conn) -> list[dict]:
 def repondre(conn, texte: str, auteur: str = "") -> str:
     brut = texte.strip()
     plie = plier(brut)
+    suite = _resoudre_attente(conn, brut)
+    if suite:
+        return suite
     if not brut:
         return "Dis-moi un truc, ou envoie une photo."
     if any(mot in plie for mot in ("aide", "bonjour", "salut", "tu sais faire")):
@@ -95,6 +134,10 @@ def repondre(conn, texte: str, auteur: str = "") -> str:
             "Tu peux me demander où est un truc, me dire « plus de lait », "
             "m'envoyer la photo du ticket ou du frigo, ou demander ce qu'on mange."
         )
+    if "liste" in plie and "course" in plie and any(mot in plie for mot in ("range", "actualise", "stock")):
+        return _cloturer_courses(conn)
+    if "liste" in plie and "course" in plie and any(mot in plie for mot in ("ajoute", "ajout", "mets")):
+        return _ajouter_liste(conn, brut)
     if plie.startswith("ou ") or "ou est" in plie or "ou sont" in plie:
         return _ou_est(conn, brut)
     if plie.startswith("range") or plie.startswith("mets ") or plie.startswith("pose "):
@@ -131,6 +174,83 @@ def _stock_noms(conn) -> list[str]:
 
 def _cuisine(conn) -> str:
     return formuler_recette(_stock_noms(conn))
+
+
+def _precision(nom: str) -> dict | None:
+    for cle, regle in _PRECISIONS:
+        if mot_dans(cle, nom) or cle in nom:
+            return regle
+    return None
+
+
+def _poser_course(conn, nom: str, quantite: float, unite: str) -> None:
+    produit = _assurer(conn, nom, 0, "plus")
+    courses.ajouter(conn, {
+        "nom": produit["nom"],
+        "produit_id": produit["id"],
+        "quantite": quantite,
+        "unite": unite,
+        "rayon": produit["rayon"],
+        "lier": True,
+    })
+
+
+def _ajouter_liste(conn, texte: str) -> str:
+    notes = []
+    questions = []
+    for nom in _noms(texte):
+        regle = _precision(nom) or {"nom": presenter_nom(nom), "quantite": 1, "unite": "pièce"}
+        if "question" in regle:
+            questions.append(regle)
+            continue
+        _poser_course(conn, regle["nom"], regle["quantite"], regle["unite"])
+        if regle.get("suppose"):
+            notes.append(regle["suppose"])
+        else:
+            notes.append(f"{regle['nom']} ajouté.")
+    if questions:
+        _ecrire_attente(conn, {"questions": questions})
+    else:
+        _ecrire_attente(conn, None)
+    if not notes and not questions:
+        return "Je n'ai pas entendu les articles. Répète : lait, pain de mie, œufs, coca."
+    morceaux = []
+    if notes:
+        morceaux.append("OK. " + " ".join(notes))
+    if questions:
+        morceaux.append(questions[0]["question"])
+    return " ".join(morceaux)
+
+
+def _resoudre_attente(conn, texte: str) -> str | None:
+    attente = _lire_attente(conn)
+    if not attente or not attente.get("questions"):
+        return None
+    nombres = [int(valeur) for valeur in re.findall(r"\d+", texte)]
+    if not nombres:
+        return None
+    question = attente["questions"][0]
+    choix = question.get("choix") or []
+    if choix and nombres[0] not in choix:
+        return question["question"]
+    _poser_course(conn, question["nom"], nombres[0], question["unite"])
+    reste = attente["questions"][1:]
+    _ecrire_attente(conn, {"questions": reste} if reste else None)
+    suite = f"{question['nom']} : {nombres[0]}. C'est sur la liste."
+    if reste:
+        suite += " " + reste[0]["question"]
+    return suite
+
+
+def _cloturer_courses(conn) -> str:
+    lignes = [ligne for ligne in courses.lister(conn) if not ligne["coche"]]
+    if not lignes:
+        return "La liste de courses est déjà vide."
+    noms = []
+    for ligne in lignes:
+        if courses.ranger(conn, ligne["id"]):
+            noms.append(ligne["nom"])
+    return "Stock actualisé : " + ", ".join(noms) + "."
 
 
 def _courses(conn) -> str:
@@ -226,16 +346,19 @@ def repondre_photo(conn, chemin, photo: str, legende: str, auteur: str) -> str:
     else:
         _noter(conn, auteur or "Quelqu'un", "personne", "Photo", photo)
     texte = ocr.lire_image(chemin)
+    codes = ocr.lire_codes(chemin)
+    qr = next((code["valeur"] for code in codes if code["type"] == "QRCODE"), "")
+    mention_qr = f"QR lu : {qr}. " if qr else ""
     lignes = ocr.extraire_lignes(texte)
     if len(lignes) >= 1:
         noms = []
         for ligne in lignes:
             produit = _assurer(conn, presenter_nom(ligne["nom"]), float(ligne["quantite"]), "y_en_a")
             noms.append(produit["nom"])
-        reponse = "J'ai lu le ticket et rangé : " + ", ".join(noms) + ".\n" + formuler_recette(_stock_noms(conn))
+        reponse = mention_qr + "J'ai lu le ticket et rangé : " + ", ".join(noms) + ".\n" + formuler_recette(_stock_noms(conn))
         _noter(conn, "Maison", "maison", reponse)
         return reponse
-    code = ocr.lire_code_barres(chemin)
+    code = next((item["valeur"] for item in codes if item["type"] != "QRCODE"), "")
     if code:
         connu = produits.trouver_code(conn, code)
         if connu:
@@ -257,6 +380,6 @@ def repondre_photo(conn, chemin, photo: str, legende: str, auteur: str) -> str:
         reponse = repondre(conn, propre or legende, auteur)
         _noter(conn, "Maison", "maison", reponse)
         return reponse
-    reponse = "Je n'ai pas reconnu le ticket. Dis les articles, par exemple : lait, œufs, pain. Ou « c'est le lait » avec la photo du paquet."
+    reponse = mention_qr + "Je n'ai pas reconnu le ticket. Dis les articles, par exemple : lait, œufs, pain. Ou « c'est le lait » avec la photo du paquet."
     _noter(conn, "Maison", "maison", reponse)
     return reponse

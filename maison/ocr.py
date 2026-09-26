@@ -24,26 +24,36 @@ def lire_image(chemin: Path) -> str:
     except ImportError:
         return ""
     try:
-        return pytesseract.image_to_string(Image.open(chemin), lang="fra") or ""
+        # psm 4 : un ticket est lu ligne par ligne, prix compris.
+        return pytesseract.image_to_string(Image.open(chemin), lang="fra", config="--psm 4") or ""
     except Exception:
         log.info("Lecture du ticket impossible, saisie manuelle.")
         return ""
 
 
-def lire_code_barres(chemin: Path) -> str:
+def lire_codes(chemin: Path) -> list[dict]:
+    """Codes-barres et QR codes. ZBar lit les deux sur une photo."""
     try:
         from PIL import Image
         from pyzbar.pyzbar import decode
     except ImportError:
-        return ""
+        return []
     try:
-        codes = decode(Image.open(chemin))
+        trouves = decode(Image.open(chemin))
     except Exception:
-        log.info("Lecture du code-barres impossible.")
-        return ""
-    if not codes:
-        return ""
-    return codes[0].data.decode("utf-8", errors="ignore")
+        log.info("Lecture des codes impossible.")
+        return []
+    codes = []
+    for code in trouves:
+        valeur = code.data.decode("utf-8", errors="ignore").strip()
+        if valeur:
+            codes.append({"type": code.type, "valeur": valeur})
+    return codes
+
+
+def lire_code_barres(chemin: Path) -> str:
+    codes = lire_codes(chemin)
+    return codes[0]["valeur"] if codes else ""
 
 
 def extraire_lignes(texte: str) -> list[dict]:

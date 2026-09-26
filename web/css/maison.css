@@ -2,18 +2,18 @@
   color-scheme: light;
   --encre: #241c16;
   --douce: #5e534a;
-  --papier: #f4efe6;
-  --carte: #fffdf8;
-  --ligne: #e6dccb;
-  --vert: #0e6b52;
-  --vert-doux: #e7f5ee;
-  --terre: #9c3418;
+  --papier: #f3f3f1;
+  --carte: #ffffff;
+  --ligne: #d8d8d2;
+  --vert: #1c1c1c;
+  --vert-doux: #ececec;
+  --terre: #1c1c1c;
   --danger: #9d342c;
   --danger-doux: #fdecea;
   --ombre: 0 10px 28px rgba(36, 28, 22, 0.06);
   --nav: 84px;
   font-family: system-ui, "Segoe UI", sans-serif;
-  font-size: 18px;
+  font-size: 16px;
   line-height: 1.4;
 }
 
@@ -141,12 +141,21 @@ textarea { min-height: 80px; }
   font-weight: 650;
 }
 .nav a.actif { color: var(--vert); }
-.nav-photo {
-  background: var(--terre);
-  color: white !important;
-  border-radius: 16px 16px 0 0;
-  padding-top: 16px !important;
+.nav-interne { grid-template-columns: 1fr 1fr; }
+.parler { display: flex; flex-direction: column; align-items: center; margin: 28px 0 18px; }
+.ptt {
+  width: 120px; height: 120px; border-radius: 50%;
+  border: 0; background: #111; color: white; font-weight: 650;
 }
+.ptt.ecoute { background: #8d1d1d; }
+.reponse { border-top: 1px solid var(--ligne); padding-top: 16px; white-space: pre-wrap; }
+.stock { display: grid; grid-template-columns: 190px 1fr; gap: 20px; }
+.colonne { display: flex; flex-direction: column; gap: 4px; }
+.groupe-nav { margin: 14px 0 4px; font-size: 0.8rem; color: var(--douce); }
+.rubrique { text-decoration: none; color: var(--encre); padding: 6px 8px; }
+.rubrique.actif { background: #111; color: white; }
+.ligne-stock { display: grid; grid-template-columns: 1.4fr 1fr auto auto; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--ligne); }
+@media (max-width: 700px) { .stock { grid-template-columns: 1fr; } }
 
 .grille { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .personne {

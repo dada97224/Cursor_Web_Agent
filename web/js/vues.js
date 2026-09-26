@@ -42,36 +42,72 @@ function carteProduit(produit) {
 
 export async function accueil(racine) {
   const donnees = await api("/api/messages");
-  const bulles = donnees.messages.length ? donnees.messages.map((message) => dom("article", {
-    classe: message.role === "maison" ? "bulle maison" : "bulle moi",
-    enfants: [
-      dom("strong", { texte: message.auteur }),
-      message.photo ? dom("img", { classe: "photo-ticket", attrs: { src: message.photo, alt: "" } }) : null,
-      dom("p", { texte: message.texte }),
-    ],
-  })) : [dom("article", {
-    classe: "bulle maison",
-    enfants: [dom("p", { texte: "Montre-moi un ticket, une photo du frigo, ou demande-moi où est le lait et ce qu'on peut cuisiner." })],
-  })];
+  const dernier = [...donnees.messages].reverse().find((message) => message.role === "maison");
   racine.append(
-    barre("Maison"),
-    donnees.aujourd_hui ? dom("p", { classe: "rappel", texte: donnees.aujourd_hui }) : null,
-    dom("div", { classe: "fil", attrs: { id: "fil" }, enfants: bulles }),
-    dom("div", { classe: "suggestions", enfants: [
-      suggestion("Où est le lait ?"),
-      suggestion("Qu'est-ce qu'on mange ?"),
-      suggestion("Plus de pain"),
+    dom("header", { classe: "entete", enfants: [dom("h1", { texte: "Jarvis" })] }),
+    dom("div", { classe: "parler", enfants: [
+      dom("button", {
+        classe: "ptt",
+        texte: "Parler",
+        attrs: { type: "button", "data-action": "parler", "aria-label": "Maintenir pour parler" },
+      }),
+      dom("p", { classe: "detail", texte: "Maintenir pour parler. Relâcher pour envoyer." }),
     ]}),
     dom("form", { classe: "compositeur", attrs: { "data-form": "dire" }, enfants: [
-      dom("input", { attrs: { name: "texte", placeholder: "Parle, ou envoie une photo", autocomplete: "off" } }),
+      dom("input", { attrs: { name: "texte", placeholder: "Écrire à Jarvis", autocomplete: "off" } }),
       dom("input", { attrs: { type: "file", name: "photo", accept: "image/*", capture: "environment", id: "photo-chat" } }),
-      bouton("Photo", "choisir-photo", { classe: "bouton-secondaire bouton-ligne", attrs: {} }),
-      bouton("Micro", "micro", { classe: "bouton-secondaire bouton-ligne", attrs: {} }),
+      bouton("Photo", "choisir-photo", { classe: "bouton-secondaire bouton-ligne" }),
       bouton("Envoyer", "rien", { classe: "bouton bouton-ligne", attrs: { type: "submit" } }),
     ]}),
+    dernier ? dom("article", { classe: "reponse", enfants: [dom("p", { texte: dernier.texte })] }) : dom("p", { classe: "detail", texte: "Ajoute du lait, du pain de mie, des œufs et du coca à la liste. Ou dis que les courses sont rangées." }),
   );
-  const fil = document.getElementById("fil");
-  if (fil) fil.scrollTop = fil.scrollHeight;
+}
+
+const RUBRIQUES = [
+  { id: "frigo", groupe: "Cuisine", titre: "Frigo", test: (p) => p.categorie === "cuisine" && /frigo/i.test(p.lieu_libelle || "") },
+  { id: "congelo", groupe: "Cuisine", titre: "Congélateur", test: (p) => p.categorie === "congelo" },
+  { id: "secs", groupe: "Cuisine", titre: "Secs", test: (p) => p.categorie === "cuisine" && /placard/i.test(p.lieu_libelle || "") },
+  { id: "reserves", groupe: "Cuisine", titre: "Réserves", test: (p) => p.categorie === "cuisine" && /conserve/i.test(p.lieu_libelle || "") },
+  { id: "pharmacie", groupe: "Santé", titre: "Pharmacie", test: (p) => p.categorie === "pharmacie" },
+  { id: "entretien", groupe: "Maison", titre: "Entretien", test: (p) => p.categorie === "consommable" },
+  { id: "courses", groupe: "Courses", titre: "Liste", test: null },
+];
+
+export async function stock(racine, rubriqueId) {
+  const produits = await api("/api/produits");
+  const liste = await api("/api/courses");
+  const actif = RUBRIQUES.find((item) => item.id === rubriqueId) || RUBRIQUES[0];
+  const elements = actif.id === "courses"
+    ? liste
+    : produits.filter((produit) => actif.test(produit) || (actif.id === "secs" && produit.categorie === "cuisine" && !/frigo|conserve/i.test(produit.lieu_libelle || "")));
+  let groupe = "";
+  const liens = [];
+  for (const rubrique of RUBRIQUES) {
+    if (rubrique.groupe !== groupe) {
+      groupe = rubrique.groupe;
+      liens.push(dom("p", { classe: "groupe-nav", texte: groupe }));
+    }
+    liens.push(dom("a", {
+      classe: rubrique.id === actif.id ? "rubrique actif" : "rubrique",
+      texte: rubrique.titre,
+      attrs: { href: `#/stock/${rubrique.id}` },
+    }));
+  }
+  racine.append(
+    dom("div", { classe: "stock", enfants: [
+      dom("nav", { classe: "colonne", attrs: { "aria-label": "Catégories" }, enfants: liens }),
+      dom("section", { enfants: [
+        dom("h1", { texte: `${actif.groupe} — ${actif.titre}` }),
+        ...elements.map((element) => dom("article", { classe: "ligne-stock", enfants: [
+          dom("strong", { texte: element.nom }),
+          dom("span", { texte: element.lieu_libelle || element.rayon || "" }),
+          dom("span", { texte: `${element.quantite} ${element.unite || ""}`.trim() }),
+          element.date_limite ? dom("span", { texte: element.date_limite }) : null,
+        ]})),
+        elements.length ? null : dom("p", { classe: "detail", texte: "Rien dans cette catégorie." }),
+      ]}),
+    ]}),
+  );
 }
 
 function suggestion(texte) {
