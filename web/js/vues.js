@@ -53,7 +53,7 @@ export async function accueil(racine) {
         texte: "Parler",
         attrs: { type: "button", "data-action": "parler", "aria-label": "Maintenir pour parler" },
       }),
-      dom("p", { classe: "detail", texte: "Appuie pour parler. Relâche quand tu as fini : la phrase est transcrite sur cet ordinateur." }),
+      dom("p", { classe: "detail", texte: "Appuie pour parler. Reparle sur le bouton quand tu as fini." }),
     ]}),
     dom("form", { classe: "compositeur", attrs: { "data-form": "dire" }, enfants: [
       dom("input", { attrs: { name: "texte", placeholder: "Écrire à Jarvis", autocomplete: "off" } }),

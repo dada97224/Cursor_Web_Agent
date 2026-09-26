@@ -354,7 +354,7 @@ document.body.addEventListener("input", (evenement) => {
 let enregistreur = null;
 let fluxMicro = null;
 let morceauxAudio = [];
-let debutParole = 0;
+let limiteParole = 0;
 
 async function demarrerParole(bouton) {
   if (!navigator.mediaDevices?.getUserMedia) {
@@ -363,28 +363,32 @@ async function demarrerParole(bouton) {
   }
   fluxMicro = await navigator.mediaDevices.getUserMedia({ audio: true });
   morceauxAudio = [];
-  const mime = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
+  const mime = ["audio/webm;codecs=opus", "audio/webm"].find((type) => MediaRecorder.isTypeSupported(type)) || "";
   enregistreur = new MediaRecorder(fluxMicro, mime ? { mimeType: mime } : undefined);
   enregistreur.ondataavailable = (evenement) => {
     if (evenement.data.size) morceauxAudio.push(evenement.data);
   };
-  enregistreur.onstop = () => envoyerParole(bouton);
-  enregistreur.start();
-  debutParole = Date.now();
+  enregistreur.onstop = () => envoyerParole(bouton, enregistreur.mimeType);
+  enregistreur.start(200);
   bouton.classList.add("ecoute");
   bouton.textContent = "J'écoute";
+  clearTimeout(limiteParole);
+  limiteParole = setTimeout(() => arreterParole(), 20000);
 }
 
-async function envoyerParole(bouton) {
-  const blob = new Blob(morceauxAudio, { type: enregistreur?.mimeType || "audio/webm" });
+async function envoyerParole(bouton, mime) {
+  clearTimeout(limiteParole);
+  const blob = new Blob(morceauxAudio, { type: mime || "audio/webm" });
   fluxMicro?.getTracks().forEach((piste) => piste.stop());
   enregistreur = null;
   fluxMicro = null;
+  morceauxAudio = [];
   bouton.classList.remove("ecoute");
   bouton.textContent = "Je transcris";
   try {
     const corps = new FormData();
-    corps.append("audio", blob, "voix.webm");
+    const extension = (mime || "").includes("mp4") ? "m4a" : "webm";
+    corps.append("audio", blob, `voix.${extension}`);
     corps.append("auteur", personne().nom || "");
     const resultat = await api("/api/parler", { method: "POST", corps });
     const champTexte = document.querySelector("input[name=texte]");
@@ -399,6 +403,7 @@ async function envoyerParole(bouton) {
 
 function arreterParole() {
   if (!enregistreur || enregistreur.state !== "recording") return;
+  enregistreur.requestData();
   enregistreur.stop();
 }
 
@@ -410,13 +415,10 @@ document.body.addEventListener("pointerdown", (evenement) => {
     arreterParole();
     return;
   }
-  demarrerParole(boutonParler).catch((erreur) => montrerErreur(erreur));
-});
-
-document.body.addEventListener("pointerup", () => {
-  if (!enregistreur) return;
-  if (Date.now() - debutParole < 450) return;
-  arreterParole();
+  demarrerParole(boutonParler).catch((erreur) => {
+    boutonParler.textContent = "Parler";
+    montrerErreur(erreur);
+  });
 });
 
 window.addEventListener("hashchange", rendre);
