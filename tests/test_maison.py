@@ -133,6 +133,19 @@ def test_liste_avec_precision(client):
     assert client.get("/api/courses").json() == []
 
 
+def test_parole_transcrite(client, monkeypatch):
+    monkeypatch.setattr("maison.voix.transcrire", lambda chemin: "il faudrait acheter du lait et du pain")
+    reponse = client.post(
+        "/api/parler",
+        files={"audio": ("voix.webm", b"x" * 1000, "audio/webm")},
+    )
+    assert reponse.status_code == 200
+    assert reponse.json()["transcription"].startswith("il faudrait")
+    noms = [ligne["nom"] for ligne in client.get("/api/courses").json()]
+    assert "Lait" in noms
+    assert "Pain" in noms
+
+
 def test_menus_et_plante(client):
     semaine = client.get("/api/menus").json()
     assert len(semaine) == 7

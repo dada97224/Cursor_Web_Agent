@@ -4,7 +4,7 @@ Application locale pour la maison. Elle tourne sur un ordinateur, et les télép
 
 L'accueil est Jarvis : un bouton à maintenir pour parler, et un champ texte en dessous. Le stock s'ouvre à part, avec les catégories à gauche (frigo, congélateur, secs, réserves, pharmacie, entretien, courses).
 
-Le bouton micro utilise la dictée du navigateur. Elle ne marche qu'en contexte sécurisé : `localhost` sur l'ordinateur, ou HTTPS pour les téléphones. En HTTP sur le Wi-Fi, c'est le micro du clavier. Une dictée locale (faster-whisper, modèle `small`, français, CPU) peut venir ensuite, une fois le micro autorisé.
+Le bouton Parler enregistre le micro et envoie le son à l'ordinateur. La transcription est faite localement par Whisper (`base`, français). La première fois, le modèle se télécharge. `MAISON_WHISPER=small` entend mieux, et prend plus de place. Le micro du navigateur reste réservé à `localhost` ou à une adresse HTTPS.
 
 Les tickets passent par Tesseract (`--psm 4`). Les QR codes et les codes-barres passent par ZBar, sur la même photo. Une photo du frigo sans texte lisible n'est pas reconnue : il n'y a pas de modèle de vision installé.
 

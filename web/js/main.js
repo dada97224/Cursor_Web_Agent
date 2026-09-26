@@ -351,40 +351,72 @@ document.body.addEventListener("input", (evenement) => {
   }
 });
 
-let parole = null;
+let enregistreur = null;
+let fluxMicro = null;
+let morceauxAudio = [];
+let debutParole = 0;
+
+async function demarrerParole(bouton) {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    montrerErreur(new Error("Le micro est bloqué sur cette adresse. Ouvre Jarvis en localhost, ou en https."));
+    return;
+  }
+  fluxMicro = await navigator.mediaDevices.getUserMedia({ audio: true });
+  morceauxAudio = [];
+  const mime = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
+  enregistreur = new MediaRecorder(fluxMicro, mime ? { mimeType: mime } : undefined);
+  enregistreur.ondataavailable = (evenement) => {
+    if (evenement.data.size) morceauxAudio.push(evenement.data);
+  };
+  enregistreur.onstop = () => envoyerParole(bouton);
+  enregistreur.start();
+  debutParole = Date.now();
+  bouton.classList.add("ecoute");
+  bouton.textContent = "J'écoute";
+}
+
+async function envoyerParole(bouton) {
+  const blob = new Blob(morceauxAudio, { type: enregistreur?.mimeType || "audio/webm" });
+  fluxMicro?.getTracks().forEach((piste) => piste.stop());
+  enregistreur = null;
+  fluxMicro = null;
+  bouton.classList.remove("ecoute");
+  bouton.textContent = "Je transcris";
+  try {
+    const corps = new FormData();
+    corps.append("audio", blob, "voix.webm");
+    corps.append("auteur", personne().nom || "");
+    const resultat = await api("/api/parler", { method: "POST", corps });
+    const champTexte = document.querySelector("input[name=texte]");
+    if (champTexte) champTexte.value = resultat.transcription;
+    sessionStorage.setItem("maison.voix", "1");
+    await rendre();
+  } catch (erreur) {
+    bouton.textContent = "Parler";
+    montrerErreur(erreur);
+  }
+}
+
+function arreterParole() {
+  if (!enregistreur || enregistreur.state !== "recording") return;
+  enregistreur.stop();
+}
 
 document.body.addEventListener("pointerdown", (evenement) => {
   const boutonParler = evenement.target.closest("[data-action=parler]");
   if (!boutonParler) return;
   evenement.preventDefault();
-  if (!window.isSecureContext) {
-    montrerErreur(new Error("Le bouton micro ne marche qu'en adresse sécurisée, ou sur cet ordinateur en localhost. Sur le téléphone, utilise le micro du clavier."));
+  if (enregistreur) {
+    arreterParole();
     return;
   }
-  const Reconnaissance = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!Reconnaissance) {
-    montrerErreur(new Error("Ce navigateur ne dicte pas. Chrome sur l'ordinateur sait le faire."));
-    return;
-  }
-  parole = new Reconnaissance();
-  parole.lang = "fr-FR";
-  boutonParler.classList.add("ecoute");
-  parole.onresult = async (resultat) => {
-    const texte = resultat.results[0][0].transcript;
-    const champTexte = document.querySelector("input[name=texte]");
-    if (champTexte) champTexte.value = texte;
-    sessionStorage.setItem("maison.voix", "1");
-    await api("/api/messages", { method: "POST", corps: { texte, auteur: personne().nom || "" } });
-    await rendre();
-  };
-  parole.start();
+  demarrerParole(boutonParler).catch((erreur) => montrerErreur(erreur));
 });
 
 document.body.addEventListener("pointerup", () => {
-  if (!parole) return;
-  parole.stop();
-  parole = null;
-  document.querySelector(".ptt")?.classList.remove("ecoute");
+  if (!enregistreur) return;
+  if (Date.now() - debutParole < 450) return;
+  arreterParole();
 });
 
 window.addEventListener("hashchange", rendre);

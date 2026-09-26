@@ -5,7 +5,7 @@ from datetime import date
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from maison import assistant, config, courses, foyer, ocr, produits, rappels
+from maison import assistant, config, courses, foyer, ocr, produits, rappels, voix
 from maison.db import ouvrir
 from maison.erreurs import ErreurMaison
 from maison.images import enregistrer_image, url_media
@@ -634,6 +634,24 @@ def messages():
     with ouvrir() as conn:
         rappel = " · ".join(item["titre"] for item in rappels.rappels(conn)[:3])
         return {"messages": assistant.histoires(conn), "aujourd_hui": rappel}
+
+
+@routeur.post("/parler")
+async def parler(audio: UploadFile = File(...), auteur: str = Form(default="")):
+    contenu = await audio.read()
+    if len(contenu) < 800:
+        raise ErreurMaison("Je n'ai presque rien entendu. Reste appuyé le temps de parler, puis relâche.")
+    type_audio = audio.content_type or ""
+    suffixe = ".mp4" if "mp4" in type_audio else ".wav" if "wav" in type_audio else ".webm"
+    nom = f"voix-{maintenant_iso().replace(':', '')}{suffixe}"
+    chemin = config.chemin_uploads() / nom
+    chemin.write_bytes(contenu)
+    transcription = voix.transcrire(chemin)
+    if not transcription:
+        raise ErreurMaison("Je n'ai pas distingué de phrase. Réessaie.")
+    with ouvrir() as conn:
+        reponse = assistant.discuter(conn, transcription, auteur)
+        return {"transcription": transcription, "reponse": reponse, "messages": assistant.histoires(conn)}
 
 
 @routeur.post("/messages")

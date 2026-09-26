@@ -73,7 +73,7 @@ def _noms(fragment: str) -> list[str]:
     for morceau in morceaux:
         morceau = _ARTICLE.sub(" ", morceau)
         morceau = re.sub(
-            r"\b(ajoute|ajout|liste|courses|semaine|range|mets|pose|met|est|sont|ou|achete|ramene|jai|ai|on|actualise|stock)\b",
+            r"\b(ajoute|ajout|ajouter|acheter|achete|faudrait|faut|il|prendre|pense|liste|courses|semaine|range|mets|pose|met|est|sont|ou|ramene|jai|ai|on|actualise|stock)\b",
             " ",
             morceau,
         )
@@ -136,25 +136,31 @@ def repondre(conn, texte: str, auteur: str = "") -> str:
         )
     if "liste" in plie and "course" in plie and any(mot in plie for mot in ("range", "actualise", "stock")):
         return _cloturer_courses(conn)
-    if "liste" in plie and "course" in plie and any(mot in plie for mot in ("ajoute", "ajout", "mets")):
-        return _ajouter_liste(conn, brut)
-    if plie.startswith("ou ") or "ou est" in plie or "ou sont" in plie:
+    # L'intention est cherchée dans toute la phrase, pas au début seulement.
+    if any(mot in plie for mot in ("ou est", "ou sont", "ou j", "trouve")):
         return _ou_est(conn, brut)
-    if plie.startswith("range") or plie.startswith("mets ") or plie.startswith("pose "):
+    if any(mot in plie for mot in ("range", "ranger", "mets ", "pose ")) and any(mot in plie for mot in ("dans ", " au ", " en ", "sous ")):
         return _ranger(conn, brut)
-    if any(mot in plie for mot in ("plus de", "plus d ", "n'a plus", "na plus", "fini le", "fini la", "fini les")):
+    if any(mot in plie for mot in ("plus de", "plus d ", "n a plus", "na plus", "fini ", "epuise", "termine")):
         return _manque(conn, brut)
-    if any(mot in plie for mot in ("achete", "ramene", "on a ", "j ai ", "jai ")):
+    if any(mot in plie for mot in ("acheter", "achete", "pense a prendre", "faut prendre")) or (
+        "liste" in plie and any(mot in plie for mot in ("ajoute", "ajout", "mets", "mettre"))
+    ):
+        return _ajouter_liste(conn, brut)
+    if any(mot in plie for mot in ("ramene", "rapporte", "j ai pris", "on a ", "j ai ", "jai ")):
         return _recu(conn, brut)
     if "arros" in plie:
         return _arroser(conn, brut, auteur)
     if "menage" in plie:
         return _menage(conn, brut, auteur)
-    if any(mot in plie for mot in ("mange", "recette", "cuisin", "ce soir", "frigo")):
+    if any(mot in plie for mot in ("mange", "recette", "cuisin", "ce soir")):
         return _cuisine(conn)
     if "course" in plie:
         return _courses(conn)
-    return "Je n'ai pas compris. Tu peux dire : où est le lait, plus de pain, ou qu'est-ce qu'on mange."
+    noms = _noms(brut)
+    if noms:
+        return "J'ai relevé : " + ", ".join(presenter_nom(nom) for nom in noms) + ". Dis-moi si c'est pour la liste, le stock, ou l'emplacement."
+    return "Je n'ai pas saisi l'action. Reformule, par exemple ce qu'il faut acheter ou où tu as rangé quelque chose."
 
 
 def discuter(conn, texte: str, auteur: str = "") -> str:

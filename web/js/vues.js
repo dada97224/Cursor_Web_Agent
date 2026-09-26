@@ -42,7 +42,9 @@ function carteProduit(produit) {
 
 export async function accueil(racine) {
   const donnees = await api("/api/messages");
-  const dernier = [...donnees.messages].reverse().find((message) => message.role === "maison");
+  const derniers = [...donnees.messages].reverse();
+  const dernier = derniers.find((message) => message.role === "maison");
+  const entendu = derniers.find((message) => message.role === "personne");
   racine.append(
     dom("header", { classe: "entete", enfants: [dom("h1", { texte: "Jarvis" })] }),
     dom("div", { classe: "parler", enfants: [
@@ -51,7 +53,7 @@ export async function accueil(racine) {
         texte: "Parler",
         attrs: { type: "button", "data-action": "parler", "aria-label": "Maintenir pour parler" },
       }),
-      dom("p", { classe: "detail", texte: "Maintenir pour parler. Relâcher pour envoyer." }),
+      dom("p", { classe: "detail", texte: "Appuie pour parler. Relâche quand tu as fini : la phrase est transcrite sur cet ordinateur." }),
     ]}),
     dom("form", { classe: "compositeur", attrs: { "data-form": "dire" }, enfants: [
       dom("input", { attrs: { name: "texte", placeholder: "Écrire à Jarvis", autocomplete: "off" } }),
@@ -59,7 +61,8 @@ export async function accueil(racine) {
       bouton("Photo", "choisir-photo", { classe: "bouton-secondaire bouton-ligne" }),
       bouton("Envoyer", "rien", { classe: "bouton bouton-ligne", attrs: { type: "submit" } }),
     ]}),
-    dernier ? dom("article", { classe: "reponse", enfants: [dom("p", { texte: dernier.texte })] }) : dom("p", { classe: "detail", texte: "Ajoute du lait, du pain de mie, des œufs et du coca à la liste. Ou dis que les courses sont rangées." }),
+    entendu ? dom("p", { classe: "detail", texte: `Entendu : ${entendu.texte}` }) : null,
+    dernier ? dom("article", { classe: "reponse", enfants: [dom("p", { texte: dernier.texte })] }) : dom("p", { classe: "detail", texte: "Parle, ou écris. Jarvis transcrit puis décide quoi faire." }),
   );
 }
 
